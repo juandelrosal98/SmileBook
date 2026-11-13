@@ -188,7 +188,7 @@ input[type=range]:focus-visible::-webkit-slider-thumb{box-shadow:0 0 0 4px var(-
 .stepn{width:20px;height:20px;border-radius:50%;background:var(--raise-2);display:grid;place-items:center;font-size:11.5px;font-weight:700;flex:none}
 .btn.step.done .stepn{background:var(--ok);color:#fff}
 .btn.step[aria-pressed="true"] .stepn{background:var(--accent);color:#fff}
-.lmwrap{position:relative;align-self:center;max-width:100%;border-radius:var(--r-m);overflow:hidden;background:var(--stage)}
+.lmwrap{position:relative;align-self:center;justify-self:center;width:fit-content;margin:0 auto;max-width:100%;border-radius:var(--r-m);overflow:hidden;background:var(--stage)}
 .lmwrap img{display:block;max-width:100%;max-height:62vh;cursor:crosshair;user-select:none;-webkit-user-drag:none}
 .lm{position:absolute;width:22px;height:22px;margin:-11px 0 0 -11px;border-radius:50%;border:2px solid #ffd60a;box-shadow:0 0 0 1px rgba(0,0,0,.6),inset 0 0 0 1px rgba(0,0,0,.6);pointer-events:none}
 .lm::after{content:"";position:absolute;left:50%;top:50%;width:3px;height:3px;margin:-1.5px;background:#ffd60a;border-radius:50%}
@@ -310,8 +310,8 @@ kbd{display:inline-block;min-width:22px;padding:2px 6px;margin-left:3px;border-r
 .ppbtns{flex-direction:column}
 .ppcount{margin:0;font-size:15px;font-weight:600}
 .pp .lmwrap img{max-height:68vh;touch-action:none}
-.lmwrap.small{align-self:stretch}
-.lmwrap.small img{max-height:150px;width:100%;object-fit:contain;cursor:default}
+.lmwrap.small{align-self:center}
+.lmwrap.small img{max-height:150px;max-width:100%;cursor:default}
 .loupe{position:absolute;width:150px;height:150px;border-radius:50%;box-shadow:0 0 0 3px #fff,0 8px 28px rgba(0,0,0,.45);pointer-events:none;z-index:2}
 .chooser.multi .thumb.sel .ph{box-shadow:0 0 0 3px var(--accent),0 0 0 5px var(--accent-soft)}
 .optrow{display:flex;flex-wrap:wrap;gap:8px 18px}
@@ -1476,7 +1476,7 @@ async function openSealedFile(f, start, key){
     out.push(await aesOpen(key, {iv, ct: await f.slice(o + 16, o + 16 + len).arrayBuffer()})); o += 16 + len; }
   return new Blob(out).arrayBuffer();
 }
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.2.1';
 /* the installed app announces a downloaded update; one tap swaps it in (after pending saves) and reloads */
 addEventListener('ps-update', e => {
   if ($('#updBar')) return;
@@ -3889,14 +3889,14 @@ function validLm(rec){
 }
 /* two-point picker with a magnifier loupe (precise with finger or pen); the photo is decrypted before it is shown and measured */
 async function pickTwoPoints(rec, title, opts = {}){
-  const key = opts.useEdited && rec.edited ? 'edited' : 'original';
+  const key = opts.useEdited && rec.edited ? 'edited' : rec.base ? 'base' : 'original';
   if (rec[key]?.__lazy) rec = {...rec, [key]: await realBlob(rec[key])};
   if (opts.ref?.blob) opts = {...opts, ref: {...opts.ref, url: URL.createObjectURL(await realBlob(opts.ref.blob))}};
   return pickTwoPointsShow(rec, title, opts);
 }
 function pickTwoPointsShow(rec, title, opts = {}){
-  const blob = opts.useEdited ? (rec.edited || rec.original) : rec.original;
-  const url = blobUrl((opts.useEdited ? 'pe:' : 'po:') + rec.id, blob);
+  const blob = opts.useEdited ? (rec.edited || rec.base || rec.original) : (rec.base || rec.original);
+  const url = URL.createObjectURL(blob);
   const pts = (opts.initial || []).map(p => ({...p}));
   let auto = true; try { auto = localStorage.getItem('ec-auto') !== '0'; } catch {}
   const refHtml = opts.ref ? `<div class="lmwrap small" id="ppRef"><img src="${opts.ref.url}" alt="Referencia" draggable="false"></div><p class="hint">Toca en esta foto los <b>mismos puntos</b>, en el mismo orden.</p>` :
