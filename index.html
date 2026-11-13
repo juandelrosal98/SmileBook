@@ -1394,14 +1394,20 @@ const SESSION_LABELS = ['Inicial', 'Intermedia', 'Final', 'Revisión', 'Seguimie
    from the password (PBKDF2-SHA-256, 600 000 rounds) and, separately, from a recovery code.
    ====================================================================== */
 const ENC_STORES = new Set(['patients', 'cases', 'sessions', 'images', 'posts', 'drafts', 'perio', 'secrets']);
-const VAULT = {rec: null, key: null, onProgress: null};
+const VAULT = {rec: null, key: null, onProgress: null, extra: [], unreadable: 0};
 const PBKDF2_ITER = 600000, CHUNK = 16 * 1048576, te = new TextEncoder(), td = new TextDecoder();
 async function kek(secret, salt, iter = PBKDF2_ITER){
   const base = await crypto.subtle.importKey('raw', te.encode(String(secret).normalize('NFKC')), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey({name: 'PBKDF2', salt, iterations: iter, hash: 'SHA-256'}, base, {name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']);
 }
 async function aesSeal(key, data){ const iv = crypto.getRandomValues(new Uint8Array(12)); return {iv, ct: await crypto.subtle.encrypt({name: 'AES-GCM', iv}, key, data)}; }
-const aesOpen = (key, b) => crypto.subtle.decrypt({name: 'AES-GCM', iv: b.iv}, key, b.ct);
+const aesOpen1 = (key, b) => crypto.subtle.decrypt({name: 'AES-GCM', iv: b.iv}, key, b.ct);
+/* with the current data key, also try keys recovered from an earlier encryption (see keyringLoad) */
+async function aesOpen(key, b){
+  try { return await aesOpen1(key, b); }
+  catch (e){ if (key !== VAULT.key || !VAULT.extra.length) throw e;
+    for (const k of VAULT.extra){ try { return await aesOpen1(k, b); } catch {} } throw e; }
+}
 const importDataKey = raw => crypto.subtle.importKey('raw', raw, {name: 'AES-GCM'}, false, ['encrypt', 'decrypt']);
 function newRecoveryCode(){ const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', r = crypto.getRandomValues(new Uint8Array(24)); let s = ''; r.forEach((b, i) => { s += A.charAt(b % 32); if (i % 4 === 3 && i < 23) s += '-'; }); return s; }
 const normCode = c => String(c).toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/(.{4})(?=.)/g, '$1-');
@@ -1423,6 +1429,20 @@ async function sealBin(v){
   const size = blob ? v.size : buf.byteLength, n = Math.max(1, Math.ceil(size / CHUNK)), parts = [];
   for (let i = 0; i < n; i++){ const piece = blob ? await v.slice(i * CHUNK, (i + 1) * CHUNK).arrayBuffer() : buf.slice(i * CHUNK, (i + 1) * CHUNK); const sp = await aesSeal(VAULT.key, piece); parts.push({iv: sp.iv, ct: new Blob([sp.ct])}); }
   return {t: blob ? 'blob' : v instanceof ArrayBuffer ? 'ab' : v.constructor.name, type: blob ? v.type : '', size, parts};
+}
+async function keyringLoad(){
+  VAULT.extra = [];
+  try { const r = await DB.get('meta', 'keyring'); if (!r?.box) return;
+    const raw = new Uint8Array(await aesOpen1(VAULT.key, r.box));
+    for (let i = 0; i < raw.length; i += 32) VAULT.extra.push(await importDataKey(raw.slice(i, i + 32))); raw.fill(0);
+  } catch {}
+}
+async function keyringAdd(rawOld){
+  let prev = new Uint8Array(0);
+  try { const r = await DB.get('meta', 'keyring'); if (r?.box) prev = new Uint8Array(await aesOpen1(VAULT.key, r.box)); } catch {}
+  const all = new Uint8Array(prev.length + 32); all.set(prev); all.set(rawOld, prev.length);
+  await DB.put('meta', {id: 'keyring', box: await aesSeal(VAULT.key, all)}); all.fill(0); prev.fill(0);
+  await keyringLoad();
 }
 async function openBin(b, key = VAULT.key){
   const parts = []; for (const p of b.parts) parts.push(await aesOpen(key, {iv: p.iv, ct: p.ct instanceof Blob ? await p.ct.arrayBuffer() : p.ct}));
@@ -1476,7 +1496,7 @@ async function openSealedFile(f, start, key){
     out.push(await aesOpen(key, {iv, ct: await f.slice(o + 16, o + 16 + len).arrayBuffer()})); o += 16 + len; }
   return new Blob(out).arrayBuffer();
 }
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.3.1';
 /* the installed app announces a downloaded update; one tap swaps it in (after pending saves) and reloads */
 addEventListener('ps-update', e => {
   if ($('#updBar')) return;
@@ -1508,7 +1528,7 @@ const DB = {
   async all(s){
     const rows = await this.tx(s, 'readonly', os => os.getAll());
     if (!rows || !ENC_STORES.has(s) || !VAULT.key) return rows;
-    const out = []; for (const r of rows){ try { out.push(await openRec(r, s)); } catch { console.warn('registro ilegible', s, r?.id); } VAULT.onProgress?.(); } return out;
+    const out = []; for (const r of rows){ try { out.push(await openRec(r, s)); } catch { VAULT.unreadable++; console.warn('registro ilegible', s, r?.id); } VAULT.onProgress?.(); } return out;
   },
   async get(s, id){ const r = await this.tx(s, 'readonly', os => os.get(id)); return ENC_STORES.has(s) && VAULT.key ? openRec(r, s) : r; },
   async put(s, o){
@@ -1640,7 +1660,7 @@ function lockScreen(mode = 'pw'){
         try { raw = await unwrapWith(VAULT.rec, val, mode); }
         catch { $('#lockGo').disabled = false; $('#lockGo').textContent = 'Desbloquear'; $('#lockErr').textContent = mode === 'pw' ? 'Contraseña incorrecta.' : 'Clave de recuperación incorrecta.';
           const f = el.querySelector('form'); f.classList.remove('shake'); void f.offsetWidth; f.classList.add('shake'); $('#lockIn').select(); return; }
-        VAULT.key = await importDataKey(raw); await resumeSave(raw);
+        VAULT.key = await importDataKey(raw); await resumeSave(raw); await keyringLoad();
         if (mode === 'rec'){ const pw = await askNewPassword(el); Object.assign(VAULT.rec, await wrapPassword(raw, pw)); await DB.put('meta', VAULT.rec); }
         raw.fill(0);
         el.innerHTML = `<div class="lockcard"><div class="lockmark">${logoSvg(56, 1.6)}</div><h2>Abriendo tu archivo…</h2><p class="hint" id="lockProg">Descifrando</p></div>`;
@@ -1655,7 +1675,7 @@ async function vaultGate(){
   try { VAULT.rec = (await DB.get('meta', 'vault')) || null; } catch {}
   if (!VAULT.rec) return null;
   const key = await resumeTry();
-  if (key){ VAULT.key = key; lastAct = Date.now(); const el = lockHost();
+  if (key){ VAULT.key = key; await keyringLoad(); lastAct = Date.now(); const el = lockHost();
     el.innerHTML = `<div class="lockcard"><div class="lockmark">${logoSvg(56, 1.6)}</div><h2>Abriendo tu archivo…</h2><p class="hint" id="lockProg">Descifrando</p></div>`;
     let n = 0; VAULT.onProgress = () => { if (++n % 10 === 0){ const pg = $('#lockProg'); if (pg) pg.textContent = `Descifrando · ${n} registros`; } };
     return el; }
@@ -1671,8 +1691,11 @@ async function resumeEncryption(){
   if (!VAULT.key) return;
   for (const s of ENC_STORES){ let rows = []; try { rows = (await DB.raw(s)).filter(r => !r.__enc); } catch {} for (const r of rows) await DB.put(s, r).catch(() => {}); }
 }
-function enableVault(){
+async function enableVault(){
   if (VAULT.rec) return;
+  // another window (the installed app and the browser share the same archive) may have turned it on meanwhile
+  const there = await DB.get('meta', 'vault').catch(() => null);
+  if (there){ toast('El cifrado ya está activado en otra ventana. Recargando…'); setTimeout(() => location.reload(), 1200); return; }
   openDialog(`<h3>Cifrar el archivo de pacientes</h3>
     <p class="hint">Pacientes, casos, fotos, radiografías, STL, TAC, periodontogramas y publicaciones se guardarán cifrados (AES-256) en este dispositivo. Al abrir Smilebook se pedirá la contraseña, y se bloqueará solo tras un rato sin uso.</p>
     ${pwFields(false)}<div class="foot"><button class="btn" type="button" id="pwNo">Cancelar</button><button class="btn primary" type="button" id="pwOk">Continuar</button></div>`);
@@ -1697,11 +1720,11 @@ async function runEncrypt(pw, code){
   try {
     const raw = crypto.getRandomValues(new Uint8Array(32)), rec = await makeVaultRec(raw, pw, code);
     VAULT.key = await importDataKey(raw); raw.fill(0);
-    await DB.put('meta', rec); VAULT.rec = rec;   // the vault record goes first, so an interrupted run resumes after the next unlock
+    await DB.put('meta', {...rec, id: 'vault-' + rec.created}); await DB.put('meta', rec); VAULT.rec = rec;   // the vault record goes first, so an interrupted run resumes after the next unlock
     const rows = {}; let total = 0, done = 0;
     for (const s of ENC_STORES){ rows[s] = (await DB.raw(s)).filter(r => !r.__enc); total += rows[s].length; }
     for (const s of ENC_STORES) for (const r of rows[s]){ await DB.put(s, r); done++; if (done % 5 === 0 || done === total){ const pg = $('#encProg'); if (pg) pg.textContent = `${done} de ${total} registros cifrados`; } }
-    closeDialog(true); $('#lockBtn').hidden = false; renderStore();
+    closeDialog(true); $('#lockBtn').hidden = false; renderStore(); try { new BroadcastChannel('smilebook').postMessage('vault'); } catch {}
     toast(`Archivo cifrado: ${total} registros. A partir de ahora se pedirá la contraseña al abrir.`);
   } catch (err){ closeDialog(null); toast('No se pudo cifrar: ' + (err?.message || err)); }
 }
@@ -1737,12 +1760,12 @@ async function resumeSave(raw){
     let dk = (await DB.get('meta', 'devkey'))?.key;
     if (!dk){ dk = await crypto.subtle.generateKey({name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']); await DB.put('meta', {id: 'devkey', key: dk}); }
     const box = await aesSeal(dk, raw);
-    await DB.put('meta', {id: 'resume', box, until: Date.now() + (PREFS.lockMin || 15) * 60000});
+    await DB.put('meta', {id: 'resume', box, until: Date.now() + (PREFS.lockMin || 480) * 60000});
   } catch {}
 }
 function resumeTouch(force){
   if (!VAULT.key || RESUME.off || (!force && Date.now() - RESUME.last < 20000)) return; RESUME.last = Date.now();
-  DB.get('meta', 'resume').then(r => { if (r && !RESUME.off){ r.until = Date.now() + (PREFS.lockMin || 15) * 60000; return DB.put('meta', r); } }).catch(() => {});
+  DB.get('meta', 'resume').then(r => { if (r && !RESUME.off){ r.until = Date.now() + (PREFS.lockMin || 480) * 60000; return DB.put('meta', r); } }).catch(() => {});
 }
 async function resumeTry(){
   try {
@@ -1773,6 +1796,7 @@ async function navRestore(){
 }
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden'){ navSave(); draftFlush(); resumeTouch(true); } });
 addEventListener('pagehide', () => { navSave(); draftFlush(); });
+try { new BroadcastChannel('smilebook').onmessage = e => { if (e.data === 'vault' && !VAULT.rec) location.reload(); }; } catch {}
 function lockNow(){
   RESUME.off = true; resumeDrop();
   const el = lockHost(); el.innerHTML = `<div class="lockcard"><div class="lockmark">${logoSvg(56, 1.6)}</div><h2>Bloqueando…</h2></div>`;
@@ -1780,7 +1804,7 @@ function lockNow(){
 }
 let lastAct = Date.now();
 for (const t of ['pointerdown', 'keydown', 'wheel', 'touchstart']) addEventListener(t, () => { lastAct = Date.now(); resumeTouch(); }, {passive: true, capture: true});
-setInterval(() => { if (VAULT.key && (PREFS.lockMin || 15) && Date.now() - lastAct > (PREFS.lockMin || 15) * 60000) lockNow(); }, 15000);
+setInterval(() => { if (VAULT.key && (PREFS.lockMin || 480) && Date.now() - lastAct > (PREFS.lockMin || 480) * 60000) lockNow(); }, 15000);
 function closeDialog(v){ $('#dlg').hidden = true; $('#dlgCard').innerHTML = ''; const r = dlgResolve; dlgResolve = null; r && r(v); }
 $('#dlg').addEventListener('click', e => { if (e.target.id === 'dlg') closeDialog(null); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#dlg').hidden) closeDialog(null); });
@@ -5678,7 +5702,7 @@ function openPrefs(tab = 'look'){
       </div>`,
     data: () => `<div class="pgroup">
         <div class="prow"><span>Cifrado del archivo<small>${VAULT.rec ? 'Activado · AES-256. Se pide la contraseña al abrir y tras un rato sin uso. Las copias de seguridad salen cifradas.' : 'Desactivado. Cualquiera que use este dispositivo podría ver a tus pacientes.'}</small></span><span class="btns">${VAULT.rec ? '<button class="btn sm" type="button" id="pfPw">Cambiar contraseña</button><button class="btn sm" type="button" id="pfLockNow">Bloquear ahora</button>' : '<button class="btn sm primary" type="button" id="pfEnc">Cifrar ahora</button>'}</span></div>
-        ${VAULT.rec ? `<div class="prow"><span>Bloqueo automático<small>Tras este tiempo sin usar la app. Si sales y vuelves antes, no pide la contraseña.</small></span><select id="pfLockMin">${[5, 15, 30, 60, 240, 480].map(m => `<option value="${m}"${(PREFS.lockMin || 15) === m ? ' selected' : ''}>${m < 60 ? m + ' min' : m / 60 + (m === 60 ? ' hora' : ' horas')}</option>`).join('')}</select></div>` : ''}
+        ${VAULT.rec ? `<div class="prow"><span>Bloqueo automático<small>Tras este tiempo sin usar la app. Si sales y vuelves antes, no pide la contraseña.</small></span><select id="pfLockMin">${[15, 60, 240, 480, 1440].map(m => `<option value="${m}"${(PREFS.lockMin || 480) === m ? ' selected' : ''}>${m < 60 ? m + ' min' : m / 60 + (m === 60 ? ' hora' : ' horas')}</option>`).join('')}</select></div>` : ''}
         <div class="prow"><span>Copia de seguridad<small>${L.lastBackup ? 'Última: ' + new Date(L.lastBackup).toLocaleDateString('es-ES') : 'Aún no has hecho ninguna.'}</small></span><span class="btns"><button class="btn sm" type="button" id="pfBackup">Descargar copia en este equipo</button><button class="btn sm" type="button" id="pfRestore">Restaurar…</button></span></div>
         <div class="prow"><span>Copia en OneDrive<small>${!VAULT.rec ? 'Activa antes el cifrado: a la nube solo suben copias cifradas.' : window.claude || !/^https?:/.test(location.protocol) ? 'Disponible en la app instalada desde tu web; aquí, dentro de claude.ai, no se puede conectar con Microsoft.' : OD.tok ? `Conectado${OD.tok.user ? ' · ' + esc(OD.tok.user) : ''}. Copias cifradas e incrementales en Aplicaciones › Smilebook: cada foto se sube una sola vez y luego solo lo nuevo. Se guardan las ${OD.keep} últimas versiones.` : 'Sin conectar.'}</small><span id="odProg" class="hint"></span></span>
           <span class="btns">${VAULT.rec && !odReady() && !window.claude && /^https?:/.test(location.protocol) ? '<button class="btn sm primary" type="button" id="pfOdGuide">Conectar OneDrive</button>' : ''}${VAULT.rec && odReady() ? (OD.tok ? '<button class="btn sm primary" type="button" id="pfOdUp">Copiar ahora</button><button class="btn sm" type="button" id="pfOdRe">Restaurar…</button><button class="btn sm ghost danger" type="button" id="pfOdOff">Desconectar</button>' : '<button class="btn sm primary" type="button" id="pfOdOn">Conectar OneDrive</button>') : ''}</span></div>
@@ -6362,6 +6386,41 @@ async function boot(){
   setView('lib'); await navRestore().catch(() => {});
   VAULT.onProgress = null; lockEl?.remove(); $('#lockBtn').hidden = !VAULT.rec; setTimeout(async () => { await resumeEncryption(); await migrateParts(); }, 1500);
   if (VAULT.key){ await odLoadTok(); await odHandleRedirect(); setTimeout(odAutoBackup, 5000); }
+  if (VAULT.unreadable) setTimeout(rescueOffer, 600);
+}
+/* Records sealed with a key this archive no longer has (encryption was switched on twice, e.g. once in the
+   browser and once in the installed app). They are never deleted: the earlier key can be recovered from an
+   older vault record (old password or recovery code) or from an encrypted backup file made back then. */
+async function rescueOffer(){
+  const olds = (await DB.raw('meta').catch(() => [])).filter(r => /^vault-/.test(r.id) && r.created !== VAULT.rec?.created);
+  const n = VAULT.unreadable;
+  openDialog(`<h3>Hay ${n} registro${n === 1 ? '' : 's'} que no se pueden abrir con tu contraseña actual</h3>
+    <p class="hint">No se han borrado: están cifrados con una clave anterior (seguramente el cifrado se activó dos veces, en el navegador y en la app). Para recuperarlos:</p>
+    ${olds.length ? `<label class="field"><span>Contraseña o clave de recuperación anterior</span><input type="password" id="rsIn" autocomplete="off"></label><p class="lockerr" id="rsErr"></p>` : ''}
+    <p class="hint">${olds.length ? 'O también' : 'Elige'} una copia de seguridad cifrada (.smilebook) que descargaste antes: se usará solo para sacar la clave antigua.</p>
+    <div class="foot"><button class="btn" type="button" id="rsNo">Ahora no</button><button class="btn" type="button" id="rsFile">Elegir copia…</button>${olds.length ? '<button class="btn primary" type="button" id="rsGo">Recuperar</button>' : ''}</div>`);
+  const done = async raw => { await keyringAdd(raw); raw.fill(0); closeDialog(true); toast('Clave antigua recuperada. Recargando…'); setTimeout(() => location.reload(), 1200); };
+  $('#rsNo').onclick = () => closeDialog(null);
+  if (olds.length) $('#rsGo').onclick = async () => { const v = $('#rsIn').value.trim(); if (!v) return; $('#rsGo').disabled = true;
+    for (const o of olds) for (const mode of ['pw', 'rec']){ try { return await done(await unwrapWith(o, v, mode)); } catch {} }
+    $('#rsGo').disabled = false; $('#rsErr').textContent = 'No abre ninguna clave anterior.'; };
+  $('#rsFile').onclick = () => { const inp = document.createElement('input'); inp.type = 'file';
+    inp.onchange = async () => { const f = inp.files[0]; if (!f) return;
+      if (!await isSealedFile(f)) return toast('Esa copia no está cifrada: impórtala desde Preferencias › Datos.');
+      const {rec} = await readSealedHeader(f); closeDialog(null);
+      const raw = await askBackupRaw(rec); if (raw) done(raw); else rescueOffer(); };
+    inp.click(); };
+}
+function askBackupRaw(rec){
+  return new Promise(res => {
+    openDialog(`<h3>Contraseña de esa copia</h3><p class="hint">La contraseña (o la clave de recuperación) que usabas cuando hiciste la copia.</p>
+      <input type="password" id="brIn" autocomplete="off"><p class="lockerr" id="brErr"></p>
+      <div class="foot"><button class="btn" type="button" id="brNo">Cancelar</button><button class="btn primary" type="button" id="brGo">Recuperar</button></div>`);
+    $('#brNo').onclick = () => { closeDialog(null); res(null); };
+    $('#brGo').onclick = async () => { const v = $('#brIn').value.trim();
+      for (const mode of ['pw', 'rec']){ try { const raw = await unwrapWith(rec, v, mode); closeDialog(true); return res(raw); } catch {} }
+      $('#brErr').textContent = 'No es correcta.'; };
+  });
 }
 (document.fonts ? document.fonts.ready : Promise.resolve()).then(boot, boot);
 })();
