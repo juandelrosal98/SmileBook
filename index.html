@@ -1496,7 +1496,7 @@ async function openSealedFile(f, start, key){
     out.push(await aesOpen(key, {iv, ct: await f.slice(o + 16, o + 16 + len).arrayBuffer()})); o += 16 + len; }
   return new Blob(out).arrayBuffer();
 }
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.4.1';
 /* the installed app announces a downloaded update; one tap swaps it in (after pending saves) and reloads */
 addEventListener('ps-update', e => {
   if ($('#updBar')) return;
@@ -2393,7 +2393,7 @@ async function restore(file){
    Tokens live in the encrypted 'secrets' store, so OneDrive requires the vault.
    ====================================================================== */
 const OD = {busy: false, cancel: false, auth: 'https://login.microsoftonline.com/consumers/oauth2/v2.0', graph: 'https://graph.microsoft.com/v1.0', scope: 'Files.ReadWrite.AppFolder offline_access User.Read', keep: 10, tok: null};
-const OD_CLIENT_DEFAULT = '';   // the app id registered in Azure; public by design (PKCE, no secret)
+const OD_CLIENT_DEFAULT = '548868eb-d7b5-48f9-970f-09b7b7052ccb';   // the app id registered in Azure; public by design (PKCE, no secret)
 const odClient = () => PREFS.odClientId || OD_CLIENT_DEFAULT;
 const odRedirect = () => location.origin + location.pathname;
 const odWeb = () => /^https?:/.test(location.protocol) && !window.claude;
