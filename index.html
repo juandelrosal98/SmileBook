@@ -1519,6 +1519,7 @@ async function save(store, obj){
   if (Array.isArray(arr)){ const i = arr.findIndex(x => x.id === obj.id); if (i >= 0) arr[i] = obj; else arr.push(obj); }
   try { await DB.put(store, obj); } catch (e){ toast('No se pudo guardar en este navegador: ' + (e?.message || e)); }
   requestPersist();
+  if (['patients', 'cases', 'sessions', 'images', 'perio', 'posts'].includes(store) && typeof odDirty === 'function') odDirty();
 }
 async function remove(store, id){ L[store] = L[store].filter(x => x.id !== id); try { await DB.del(store, id); } catch {} }
 async function requestPersist(){
@@ -2515,7 +2516,7 @@ function pickPatients(m, key){
 }
 async function restoreV2(m, key, pids, all){
   if (OD.busy) return toast('Hay otra operación con OneDrive en marcha.');
-  OD.busy = true; OD.cancel = false;
+  OD.busy = true; OD.cancel = false; OD.restoring = true;
   try {
     const sel = new Set(pids), cases = m.cases.filter(c => sel.has(c.patientId)), cids = new Set(cases.map(c => c.id));
     const sessions = m.sessions.filter(x => cids.has(x.caseId)), imgs = m.images.filter(i => cids.has(i.caseId));
@@ -2542,14 +2543,27 @@ async function restoreV2(m, key, pids, all){
     renderLib();
     toast(OD.cancel ? `Restauración detenida: ${done} de ${todo.length} archivos. Vuelve a restaurar para completar.` : `Restaurados ${pids.length} paciente(s): ${done - missing} archivos${missing ? `, ${missing} no se encontraron en la nube` : ''}.`);
   } catch (e){ toast('No se pudo restaurar: ' + e.message); }
-  finally { OD.busy = false; OD.cancel = false; odBar(null); }
+  finally { OD.busy = false; OD.cancel = false; OD.restoring = false; odBar(null); }
+}
+/* automatic cloud copy: on by default; runs when the app opens and 3 minutes after the last change */
+function odDirty(){
+  if (OD.restoring) return;
+  try { localStorage.setItem('ec-dirty', String(Date.now())); } catch {}
+  clearTimeout(OD.autoT); OD.autoT = setTimeout(odAutoBackup, 3 * 60 * 1000);
 }
 async function odAutoBackup(){
-  if (!PREFS.odAuto || !VAULT.key || !odReady() || !(await odLoadTok())) return;
+  if (PREFS.odAuto === false || !VAULT.key || !odReady() || OD.busy || !(await odLoadTok())) return;
   const last = (await DB.get('meta', 'lastCloud').catch(() => null))?.value || 0;
-  if (Date.now() - last > 20 * 3600 * 1000 && L.patients.some(p => !p.sample)) odBackupNow(true);
+  let dirty = 0; try { dirty = +localStorage.getItem('ec-dirty') || 0; } catch {}
+  if ((dirty > last || Date.now() - last > 20 * 3600 * 1000) && L.patients.some(p => !p.sample)) odBackupNow(true);
 }
-$('#backupBtn').onclick = backup;
+/* the sidebar button copies to OneDrive; downloading a file to this computer stays as a manual option in Preferences */
+$('#backupBtn').onclick = async () => {
+  if (VAULT.key && odReady() && await odLoadTok()) return odBackupNow(false);
+  if (!VAULT.rec) return toast('Activa el cifrado en Preferencias › Datos: después la copia irá cifrada a tu OneDrive.');
+  if (!odReady()) return toast(window.claude ? 'La copia en OneDrive funciona en la app instalada desde tu web, no dentro de claude.ai.' : 'Pega el Id. de aplicación de Microsoft en Preferencias › Datos para usar OneDrive.');
+  openPrefs('data'); toast('Conecta OneDrive para que la copia cifrada se guarde allí automáticamente.');
+};
 $('#trashBtn').onclick = () => showTrash();
 $('#restoreBtn').onclick = () => $('#zipInput').click();
 $('#zipInput').addEventListener('change', e => { const f = e.target.files[0]; if (f) restore(f); e.target.value = ''; });
@@ -5539,11 +5553,11 @@ function openPrefs(tab = 'look'){
     data: () => `<div class="pgroup">
         <div class="prow"><span>Cifrado del archivo<small>${VAULT.rec ? 'Activado · AES-256. Se pide la contraseña al abrir y tras un rato sin uso. Las copias de seguridad salen cifradas.' : 'Desactivado. Cualquiera que use este dispositivo podría ver a tus pacientes.'}</small></span><span class="btns">${VAULT.rec ? '<button class="btn sm" type="button" id="pfPw">Cambiar contraseña</button><button class="btn sm" type="button" id="pfLockNow">Bloquear ahora</button>' : '<button class="btn sm primary" type="button" id="pfEnc">Cifrar ahora</button>'}</span></div>
         ${VAULT.rec ? `<div class="prow"><span>Bloqueo automático<small>Tras este tiempo sin tocar la app.</small></span><select id="pfLockMin">${[5, 15, 30, 60].map(m => `<option value="${m}"${(PREFS.lockMin || 15) === m ? ' selected' : ''}>${m} min</option>`).join('')}</select></div>` : ''}
-        <div class="prow"><span>Copia de seguridad<small>${L.lastBackup ? 'Última: ' + new Date(L.lastBackup).toLocaleDateString('es-ES') : 'Aún no has hecho ninguna.'}</small></span><span class="btns"><button class="btn sm" type="button" id="pfBackup">Crear copia</button><button class="btn sm" type="button" id="pfRestore">Restaurar…</button></span></div>
+        <div class="prow"><span>Copia de seguridad<small>${L.lastBackup ? 'Última: ' + new Date(L.lastBackup).toLocaleDateString('es-ES') : 'Aún no has hecho ninguna.'}</small></span><span class="btns"><button class="btn sm" type="button" id="pfBackup">Descargar copia en este equipo</button><button class="btn sm" type="button" id="pfRestore">Restaurar…</button></span></div>
         <div class="prow"><span>Copia en OneDrive<small>${!VAULT.rec ? 'Activa antes el cifrado: a la nube solo suben copias cifradas.' : window.claude || !/^https?:/.test(location.protocol) ? 'Disponible en la app instalada desde tu web; aquí, dentro de claude.ai, no se puede conectar con Microsoft.' : OD.tok ? `Conectado${OD.tok.user ? ' · ' + esc(OD.tok.user) : ''}. Copias cifradas e incrementales en Aplicaciones › Smilebook: cada foto se sube una sola vez y luego solo lo nuevo. Se guardan las ${OD.keep} últimas versiones.` : 'Sin conectar.'}</small><span id="odProg" class="hint"></span></span>
           <span class="btns">${VAULT.rec && odReady() ? (OD.tok ? '<button class="btn sm primary" type="button" id="pfOdUp">Copiar ahora</button><button class="btn sm" type="button" id="pfOdRe">Restaurar…</button><button class="btn sm ghost danger" type="button" id="pfOdOff">Desconectar</button>' : '<button class="btn sm primary" type="button" id="pfOdOn">Conectar OneDrive</button>') : ''}</span></div>
         ${VAULT.rec ? `<div class="prow"><span>Id. de aplicación de Microsoft<small>El código que te da Microsoft al registrar Smilebook (portal.azure.com › Registros de aplicaciones). No es secreto.</small></span><input type="text" id="pfOdId" value="${esc(PREFS.odClientId || '')}" placeholder="00000000-0000-0000-0000-000000000000" spellcheck="false" style="max-width:300px;font-family:var(--font-mono);font-size:12px"></div>
-        <div class="prow"><span>Copia automática diaria<small>Al abrir la app, si la última copia en OneDrive tiene más de un día.</small></span><input type="checkbox" class="switch" id="pfOdAuto" ${PREFS.odAuto ? 'checked' : ''}></div>` : ''}
+        <div class="prow"><span>Copia automática en OneDrive<small>Al abrir la app y a los pocos minutos de cada cambio. Solo sube lo nuevo, cifrado.</small></span><input type="checkbox" class="switch" id="pfOdAuto" ${PREFS.odAuto !== false ? 'checked' : ''}></div>` : ''}
         <div class="prow"><span>Papelera<small>Se vacía sola a los 30 días.</small></span><button class="btn sm" type="button" id="pfTrash">Abrir papelera</button></div>
         <div class="prow"><span>Privacidad<small>Todo se guarda y procesa en este dispositivo. Al exportar se eliminan los metadatos EXIF y la ubicación. Las fotos y los casos que descargas sueltos salen sin cifrar, para poder enviarlos.</small></span></div>
       </div>`
