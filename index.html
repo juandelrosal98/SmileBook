@@ -1476,7 +1476,7 @@ async function openSealedFile(f, start, key){
     out.push(await aesOpen(key, {iv, ct: await f.slice(o + 16, o + 16 + len).arrayBuffer()})); o += 16 + len; }
   return new Blob(out).arrayBuffer();
 }
-const APP_VERSION = '1.2.1';
+const APP_VERSION = '1.3.0';
 /* the installed app announces a downloaded update; one tap swaps it in (after pending saves) and reloads */
 addEventListener('ps-update', e => {
   if ($('#updBar')) return;
@@ -1640,7 +1640,7 @@ function lockScreen(mode = 'pw'){
         try { raw = await unwrapWith(VAULT.rec, val, mode); }
         catch { $('#lockGo').disabled = false; $('#lockGo').textContent = 'Desbloquear'; $('#lockErr').textContent = mode === 'pw' ? 'Contraseña incorrecta.' : 'Clave de recuperación incorrecta.';
           const f = el.querySelector('form'); f.classList.remove('shake'); void f.offsetWidth; f.classList.add('shake'); $('#lockIn').select(); return; }
-        VAULT.key = await importDataKey(raw);
+        VAULT.key = await importDataKey(raw); await resumeSave(raw);
         if (mode === 'rec'){ const pw = await askNewPassword(el); Object.assign(VAULT.rec, await wrapPassword(raw, pw)); await DB.put('meta', VAULT.rec); }
         raw.fill(0);
         el.innerHTML = `<div class="lockcard"><div class="lockmark">${logoSvg(56, 1.6)}</div><h2>Abriendo tu archivo…</h2><p class="hint" id="lockProg">Descifrando</p></div>`;
@@ -1653,7 +1653,13 @@ function lockScreen(mode = 'pw'){
 }
 async function vaultGate(){
   try { VAULT.rec = (await DB.get('meta', 'vault')) || null; } catch {}
-  return VAULT.rec ? lockScreen() : null;
+  if (!VAULT.rec) return null;
+  const key = await resumeTry();
+  if (key){ VAULT.key = key; lastAct = Date.now(); const el = lockHost();
+    el.innerHTML = `<div class="lockcard"><div class="lockmark">${logoSvg(56, 1.6)}</div><h2>Abriendo tu archivo…</h2><p class="hint" id="lockProg">Descifrando</p></div>`;
+    let n = 0; VAULT.onProgress = () => { if (++n % 10 === 0){ const pg = $('#lockProg'); if (pg) pg.textContent = `Descifrando · ${n} registros`; } };
+    return el; }
+  return lockScreen();
 }
 async function migrateParts(){
   if (!VAULT.key) return; let keys = []; try { keys = await DB.keys('images'); } catch { return; }
@@ -1722,12 +1728,58 @@ function askBackupKey(rec){
     draw();
   });
 }
+/* Leaving the app for a moment (a call, the camera, WhatsApp) should not ask for the password again.
+   While unlocked, the data key is kept wrapped by a device key that the browser cannot export; it expires
+   after the auto-lock time without using the app, and «Bloquear» deletes it at once. */
+const RESUME = {last: 0};
+async function resumeSave(raw){
+  try {
+    let dk = (await DB.get('meta', 'devkey'))?.key;
+    if (!dk){ dk = await crypto.subtle.generateKey({name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']); await DB.put('meta', {id: 'devkey', key: dk}); }
+    const box = await aesSeal(dk, raw);
+    await DB.put('meta', {id: 'resume', box, until: Date.now() + (PREFS.lockMin || 15) * 60000});
+  } catch {}
+}
+function resumeTouch(force){
+  if (!VAULT.key || RESUME.off || (!force && Date.now() - RESUME.last < 20000)) return; RESUME.last = Date.now();
+  DB.get('meta', 'resume').then(r => { if (r && !RESUME.off){ r.until = Date.now() + (PREFS.lockMin || 15) * 60000; return DB.put('meta', r); } }).catch(() => {});
+}
+async function resumeTry(){
+  try {
+    const r = await DB.get('meta', 'resume'); if (!r) return null;
+    if (!(r.until > Date.now())){ await DB.del('meta', 'resume'); return null; }
+    const dk = (await DB.get('meta', 'devkey'))?.key; if (!dk) return null;
+    const raw = new Uint8Array(await aesOpen(dk, r.box)), key = await importDataKey(raw); raw.fill(0);
+    return key;
+  } catch { return null; }
+}
+const resumeDrop = () => DB.del('meta', 'resume').catch(() => {});
+/* remember where you were (only internal ids, never names) so reopening the app goes back there */
+function navSave(){
+  try {
+    const v = currentView(), nav = {at: Date.now(), view: v, sel: L.sel || null};
+    if (v === 'ed' && E.current) Object.assign(nav, {img: E.current.id, tab: S.tab});
+    if (v === 'perio') Object.assign(nav, {pid: PER.pid || null, exam: PER.exam?.id || null});
+    localStorage.setItem('ec-nav', JSON.stringify(nav));
+  } catch {}
+}
+async function navRestore(){
+  let nav = null; try { nav = JSON.parse(localStorage.getItem('ec-nav') || 'null'); } catch {}
+  if (!nav || Date.now() - nav.at > 12 * 3600 * 1000) return;
+  if (nav.sel && L.patients.some(p => p.id === nav.sel && alive(p))){ L.sel = nav.sel; renderLib(); }
+  if (nav.view === 'ed' && nav.img){ const im = L.images.find(i => i.id === nav.img && !i.trashed); if (im){ await openArchived(im); if (nav.tab && E.current === im) setTab(nav.tab); } }
+  else if (nav.view === 'perio' && nav.pid && L.patients.some(p => p.id === nav.pid)){
+    PER.pid = nav.pid; const ex = nav.exam && L.perio.find(e => e.id === nav.exam && !e.trashed); if (ex){ PER.exam = ex; PER.cur = null; perioMove(0); } openPerio(nav.pid); }
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden'){ navSave(); draftFlush(); resumeTouch(true); } });
+addEventListener('pagehide', () => { navSave(); draftFlush(); });
 function lockNow(){
+  RESUME.off = true; resumeDrop();
   const el = lockHost(); el.innerHTML = `<div class="lockcard"><div class="lockmark">${logoSvg(56, 1.6)}</div><h2>Bloqueando…</h2></div>`;
   setTimeout(() => location.reload(), 900);   // pending saves finish; reloading clears every decrypted byte from memory
 }
 let lastAct = Date.now();
-for (const t of ['pointerdown', 'keydown', 'wheel', 'touchstart']) addEventListener(t, () => { lastAct = Date.now(); }, {passive: true, capture: true});
+for (const t of ['pointerdown', 'keydown', 'wheel', 'touchstart']) addEventListener(t, () => { lastAct = Date.now(); resumeTouch(); }, {passive: true, capture: true});
 setInterval(() => { if (VAULT.key && (PREFS.lockMin || 15) && Date.now() - lastAct > (PREFS.lockMin || 15) * 60000) lockNow(); }, 15000);
 function closeDialog(v){ $('#dlg').hidden = true; $('#dlgCard').innerHTML = ''; const r = dlgResolve; dlgResolve = null; r && r(v); }
 $('#dlg').addEventListener('click', e => { if (e.target.id === 'dlg') closeDialog(null); });
@@ -2713,10 +2765,11 @@ function histCommit(){
   if (HIST.stack.length > 60) HIST.stack.shift();
   HIST.idx = HIST.stack.length - 1; updateUndo();
 }
-let draftT = 0;
+let draftT = 0, draftFn = null;
+function draftFlush(){ if (draftFn){ clearTimeout(draftT); const f = draftFn; draftFn = null; f(); } }
 function draftSchedule(){
   clearTimeout(draftT); const im = E.current; if (!im || currentView() !== 'ed') return;
-  draftT = setTimeout(() => {
+  draftT = setTimeout(draftFn = () => { draftFn = null;
     if (E.current !== im) return;
     if (snapshot() === E.baseline){ DB.del('drafts', im.id).catch(() => {}); return; }
     DB.put('drafts', {id: im.id, at: Date.now(), recipe: getRecipe(), mask: S.maskEmpty ? null : S.mask.slice(), refId: S.ref?.id || null}).catch(() => {});
@@ -5625,7 +5678,7 @@ function openPrefs(tab = 'look'){
       </div>`,
     data: () => `<div class="pgroup">
         <div class="prow"><span>Cifrado del archivo<small>${VAULT.rec ? 'Activado · AES-256. Se pide la contraseña al abrir y tras un rato sin uso. Las copias de seguridad salen cifradas.' : 'Desactivado. Cualquiera que use este dispositivo podría ver a tus pacientes.'}</small></span><span class="btns">${VAULT.rec ? '<button class="btn sm" type="button" id="pfPw">Cambiar contraseña</button><button class="btn sm" type="button" id="pfLockNow">Bloquear ahora</button>' : '<button class="btn sm primary" type="button" id="pfEnc">Cifrar ahora</button>'}</span></div>
-        ${VAULT.rec ? `<div class="prow"><span>Bloqueo automático<small>Tras este tiempo sin tocar la app.</small></span><select id="pfLockMin">${[5, 15, 30, 60].map(m => `<option value="${m}"${(PREFS.lockMin || 15) === m ? ' selected' : ''}>${m} min</option>`).join('')}</select></div>` : ''}
+        ${VAULT.rec ? `<div class="prow"><span>Bloqueo automático<small>Tras este tiempo sin usar la app. Si sales y vuelves antes, no pide la contraseña.</small></span><select id="pfLockMin">${[5, 15, 30, 60, 240, 480].map(m => `<option value="${m}"${(PREFS.lockMin || 15) === m ? ' selected' : ''}>${m < 60 ? m + ' min' : m / 60 + (m === 60 ? ' hora' : ' horas')}</option>`).join('')}</select></div>` : ''}
         <div class="prow"><span>Copia de seguridad<small>${L.lastBackup ? 'Última: ' + new Date(L.lastBackup).toLocaleDateString('es-ES') : 'Aún no has hecho ninguna.'}</small></span><span class="btns"><button class="btn sm" type="button" id="pfBackup">Descargar copia en este equipo</button><button class="btn sm" type="button" id="pfRestore">Restaurar…</button></span></div>
         <div class="prow"><span>Copia en OneDrive<small>${!VAULT.rec ? 'Activa antes el cifrado: a la nube solo suben copias cifradas.' : window.claude || !/^https?:/.test(location.protocol) ? 'Disponible en la app instalada desde tu web; aquí, dentro de claude.ai, no se puede conectar con Microsoft.' : OD.tok ? `Conectado${OD.tok.user ? ' · ' + esc(OD.tok.user) : ''}. Copias cifradas e incrementales en Aplicaciones › Smilebook: cada foto se sube una sola vez y luego solo lo nuevo. Se guardan las ${OD.keep} últimas versiones.` : 'Sin conectar.'}</small><span id="odProg" class="hint"></span></span>
           <span class="btns">${VAULT.rec && !odReady() && !window.claude && /^https?:/.test(location.protocol) ? '<button class="btn sm primary" type="button" id="pfOdGuide">Conectar OneDrive</button>' : ''}${VAULT.rec && odReady() ? (OD.tok ? '<button class="btn sm primary" type="button" id="pfOdUp">Copiar ahora</button><button class="btn sm" type="button" id="pfOdRe">Restaurar…</button><button class="btn sm ghost danger" type="button" id="pfOdOff">Desconectar</button>' : '<button class="btn sm primary" type="button" id="pfOdOn">Conectar OneDrive</button>') : ''}</span></div>
@@ -5675,7 +5728,7 @@ function openPrefs(tab = 'look'){
     $('#pfOdOff') && ($('#pfOdOff').onclick = async () => { await odSaveTok(null); openPrefs('data'); toast('OneDrive desconectado. Las copias siguen en tu OneDrive.'); });
     $('#pfPw') && ($('#pfPw').onclick = () => changePassword());
     $('#pfLockNow') && ($('#pfLockNow').onclick = () => lockNow());
-    $('#pfLockMin') && ($('#pfLockMin').onchange = e => { PREFS.lockMin = +e.target.value; savePrefs(); });
+    $('#pfLockMin') && ($('#pfLockMin').onchange = e => { PREFS.lockMin = +e.target.value; savePrefs(); resumeTouch(true); });
     $('#pfRestore').onclick = () => { closeDialog(null); $('#zipInput').click(); };
     $('#pfTrash').onclick = () => { closeDialog(null); showTrash(); };
   }
@@ -6306,7 +6359,7 @@ async function boot(){
   setTimeout(backfillDates, 400);
   for (const [r, f] of Object.entries(IG.brand.fonts || {})) ensureFont(f, fw(r));
   if (!L.sel && L.patients.some(alive)) L.sel = [...L.patients.filter(alive)].sort((a, b) => a.name.localeCompare(b.name, 'es'))[0].id;
-  setView('lib');
+  setView('lib'); await navRestore().catch(() => {});
   VAULT.onProgress = null; lockEl?.remove(); $('#lockBtn').hidden = !VAULT.rec; setTimeout(async () => { await resumeEncryption(); await migrateParts(); }, 1500);
   if (VAULT.key){ await odLoadTok(); await odHandleRedirect(); setTimeout(odAutoBackup, 5000); }
 }
