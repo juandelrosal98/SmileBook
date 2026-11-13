@@ -810,6 +810,7 @@ body{font-weight:300;font-feature-settings:'cv11','ss01';letter-spacing:-.005em}
 .odhead{display:flex;align-items:center;gap:10px}.odhead small{display:block;font-size:11.5px;opacity:.8;overflow-wrap:anywhere}
 .odbtns{display:flex;gap:6px;margin-top:8px}.odbtns button{flex:1;padding:7px 8px;border:0;border-radius:8px;background:rgba(255,255,255,.18);color:#fff;font:inherit;font-size:12.5px;cursor:pointer}
 .odbtns button:hover{background:rgba(255,255,255,.28)}
+.odwarn{margin:8px 0 0;font-size:12px;line-height:1.4;color:#ffe6b8}
 </style>
 
 <div class="app">
@@ -1491,9 +1492,31 @@ async function openBin(b, key = VAULT.key){
 /* a stored STL / CBCT can weigh hundreds of MB: it is only decrypted when it is downloaded */
 const lazyBin = sealed => ({__lazy: true, sealed, size: sealed.size || 0, type: sealed.type || '', blob: () => openBin(sealed), arrayBuffer: async () => { const v = await openBin(sealed); return v instanceof Blob ? v.arrayBuffer() : v instanceof ArrayBuffer ? v : v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength); }});
 const realBlob = async b => b && b.__lazy ? await b.blob() : b;
+/* a photo kept in OneDrive and not yet on this device: downloaded the first time it is shown, then kept here */
+const CLOUD = {inflight: new Map()};
+function cloudBin(ref, ownerId, k){
+  const r = {name: ref.name, size: ref.size || 0};
+  return {__lazy: true, __cloudRef: r, size: r.size, type: ref.type || '', blob: () => cloudFetch(r, ownerId, k),
+    arrayBuffer: async () => { const v = await cloudFetch(r, ownerId, k); return v instanceof Blob ? v.arrayBuffer() : v instanceof ArrayBuffer ? v : v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength); }};
+}
+function cloudFetch(ref, ownerId, k){
+  if (CLOUD.inflight.has(ref.name)) return CLOUD.inflight.get(ref.name);
+  const pr = (async () => {
+    if (!OD.tok) await odLoadTok();
+    if (!OD.tok) throw new Error('Esta foto está en tu OneDrive: inicia sesión para verla.');
+    let v;
+    try { v = await unpackBin(await odGetFile(ref.name), VAULT.key); }
+    catch (e){ const msg = navigator.onLine === false ? 'Esta foto está guardada en tu OneDrive: conéctate a internet para verla.' : 'No se pudo descargar la foto de OneDrive: ' + e.message; toast(msg); throw new Error(msg); }
+    const im = ownerId && L.images.find(x => x.id === ownerId);
+    if (im && im[k]?.__cloudRef?.name === ref.name){ im[k] = v; im.cref = {...(im.cref || {}), [k]: ref}; OD.quiet = (OD.quiet || 0) + 1; try { await save('images', im); } finally { OD.quiet--; } }
+    return v;
+  })();
+  CLOUD.inflight.set(ref.name, pr); pr.then(() => CLOUD.inflight.delete(ref.name), () => CLOUD.inflight.delete(ref.name));
+  return pr;
+}
 const isBin = v => v instanceof Blob || v instanceof ArrayBuffer || ArrayBuffer.isView(v) || !!(v && v.__lazy);
 async function sealRec(o, lazify){
-  const bins = [], refs = [], json = JSON.stringify(o, function (k, v){ if (isBin(v)){ refs.push([this, k]); return {__bin: bins.push(v) - 1}; } return v; });
+  const bins = [], refs = [], json = JSON.stringify(o, function (k, v){ if (v && v.__cloudRef) return {__cloud: v.__cloudRef}; if (isBin(v)){ refs.push([this, k]); return {__bin: bins.push(v) - 1}; } return v; });
   const sealed = []; for (const v of bins) sealed.push(await sealBin(v));
   // the record kept in memory swaps its fresh binaries for sealed handles: nothing big stays decrypted in RAM
   if (lazify) refs.forEach(([holder, k], i) => { if (holder === o) o[k] = lazyBin(sealed.at(i)); });
@@ -1506,6 +1529,7 @@ async function openRec(r, store){
   const walk = async (v, key, top) => {
     if (!v || typeof v !== 'object') return v;
     if (typeof v.__bin === 'number' && Object.keys(v).length === 1) return bin(v.__bin, store === 'images' || (top && key === 'original' && o.kind === 'file'));
+    if (v.__cloud && Object.keys(v).length === 1) return cloudBin(v.__cloud, o.id, key);
     for (const k of Object.keys(v)) v[k] = await walk(v[k], k, v === o);
     return v;
   };
@@ -1532,7 +1556,7 @@ async function openSealedFile(f, start, key){
     out.push(await aesOpen(key, {iv, ct: await f.slice(o + 16, o + 16 + len).arrayBuffer()})); o += 16 + len; }
   return new Blob(out).arrayBuffer();
 }
-const APP_VERSION = '1.6.0';
+const APP_VERSION = '1.7.0';
 /* the installed app announces a downloaded update; one tap swaps it in (after pending saves) and reloads */
 addEventListener('ps-update', e => {
   if ($('#updBar')) return;
@@ -1582,15 +1606,16 @@ const L = {patients:[], cases:[], sessions:[], images:[], posts:[], perio:[], se
 const SYNCED = new Set(['patients', 'cases', 'sessions', 'images', 'perio', 'posts']);
 const verOf = r => r?.mt || r?.updatedAt || r?.createdAt || 0;
 async function save(store, obj){
-  if (SYNCED.has(store) && !(typeof OD !== 'undefined' && OD.restoring)) obj.mt = Date.now();
+  const quiet = typeof OD !== 'undefined' && (OD.restoring || OD.quiet > 0);
+  if (SYNCED.has(store) && !quiet) obj.mt = Date.now();
   const arr = L[store];
   if (Array.isArray(arr)){ const i = arr.findIndex(x => x.id === obj.id); if (i >= 0) arr[i] = obj; else arr.push(obj); }
   try { await DB.put(store, obj); } catch (e){ toast('No se pudo guardar en este navegador: ' + (e?.message || e)); }
   requestPersist();
-  if (['patients', 'cases', 'sessions', 'images', 'perio', 'posts'].includes(store) && typeof odDirty === 'function') odDirty();
+  if (!quiet && ['patients', 'cases', 'sessions', 'images', 'perio', 'posts'].includes(store) && typeof odDirty === 'function') odDirty();
 }
 async function remove(store, id){
-  if (SYNCED.has(store)){ L.tombs = L.tombs || {}; L.tombs[id] = Date.now(); DB.put('meta', {id: 'tombs', value: L.tombs}).catch(() => {}); if (typeof odDirty === 'function') odDirty(); }
+  if (SYNCED.has(store) && !(typeof OD !== 'undefined' && (OD.restoring || OD.quiet > 0))){ L.tombs = L.tombs || {}; L.tombs[id] = Date.now(); DB.put('meta', {id: 'tombs', value: L.tombs}).catch(() => {}); if (typeof odDirty === 'function') odDirty(); }
   L[store] = L[store].filter(x => x.id !== id); try { await DB.del(store, id); } catch {} }
 async function requestPersist(){
   if (L.persistent || !navigator.storage?.persist) return;
@@ -1999,6 +2024,7 @@ async function renderStore(){
   const ago = t => { const m = Math.round((Date.now() - t) / 60000); return m < 1 ? 'ahora mismo' : m < 60 ? `hace ${m} min` : m < 1440 ? `hace ${Math.round(m / 60)} h` : `hace ${Math.round(m / 1440)} días`; };
   const od = !odWeb() ? '' : OD.tok
     ? `<div class="odcard on"><div class="odhead">${OD_ICON}<span><b>${odStateText(ago)}</b><small>${esc(OD.tok.user || '')}</small></span></div>
+       ${OD.foreign ? `<p class="odwarn">Hay pacientes en tu OneDrive guardados con otra contraseña (de otro dispositivo).</p><div class="odbtns"><button type="button" id="odSideJoin">Unir datos</button></div>` : ''}
        <div class="odbtns"><button type="button" id="odSideUp">${OD.state === 'expired' ? 'Iniciar sesión' : OD.busy ? 'Guardando…' : 'Guardar ahora'}</button><button type="button" id="odSideRe">Cargar copia</button></div></div>`
     : `<div class="odcard"><button type="button" class="odsign" id="odSideIn">${OD_ICON}<span>Iniciar sesión en OneDrive<small>Tus pacientes se guardan solos en tu nube</small></span></button></div>`;
   if (warn && OD.tok && /copia/.test(warn)) warn = '';
@@ -2007,6 +2033,14 @@ async function renderStore(){
   $('#odSideIn')?.addEventListener('click', odSignIn);
   $('#odSideUp')?.addEventListener('click', () => { if (OD.state === 'expired') return odConnect(); if (!OD.busy) odBackupNow(false); });
   $('#odSideRe')?.addEventListener('click', () => odRestorePick());
+  $('#odSideJoin')?.addEventListener('click', odJoin);
+}
+/* another device stored its copy with a different password: one question joins both, from then on they sync */
+async function odJoin(){
+  const f = OD.foreign; if (!f?.rec) return;
+  const raw = await askBackupRaw(f.rec); if (!raw) return;
+  await keyringAdd(raw); raw.fill(0); OD.foreign = null;
+  toast('Datos unidos. Trayendo los cambios del otro dispositivo…'); renderStore(); odSync();
 }
 function odStateText(ago){
   const st = OD.state || 'ok';
@@ -2021,6 +2055,33 @@ const OD_ICON = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" str
 /* one button for everything: with a password already, connect and copy (or load, on an empty device);
    on a device with no password yet, sign in first: if the cloud holds data, it loads with the account's password */
 setInterval(() => { if (OD.tok && currentView() === 'lib' && document.visibilityState === 'visible') renderStore(); }, 60 * 1000);
+/* photos already safe in OneDrive and not opened lately leave this device (the miniature stays); they come back when opened */
+function markOpened(id){ try { const o = JSON.parse(localStorage.getItem('ec-open') || '{}'); o[id] = Date.now(); localStorage.setItem('ec-open', JSON.stringify(o)); } catch {} }
+async function odFreeSpace(days = 30, silent = false){
+  if (!VAULT.key || !OD.tok) return silent ? 0 : toast('Inicia sesión en OneDrive para poder liberar espacio.');
+  let opened = {}; try { opened = JSON.parse(localStorage.getItem('ec-open') || '{}'); } catch {}
+  const idx = (await DB.get('meta', 'odIndex').catch(() => null))?.value || {names: {}, own: {}};
+  const lim = Date.now() - days * 864e5, safeUntil = L.lastCloud || 0;
+  let n = 0, bytes = 0;
+  OD.quiet = (OD.quiet || 0) + 1;
+  try {
+    for (const im of L.images){
+      if (im.sample || E.current?.id === im.id || (opened[im.id] || verOf(im)) > lim || verOf(im) > safeUntil) continue;
+      let freed = 0;
+      for (const k of ['original', 'edited', 'base', 'mask']){
+        const v = im[k]; if (!v || v.__cloudRef) continue;
+        const ref = im.cref?.[k] || idx.own?.[im.id]?.[k]; if (!ref || !idx.names[ref.name] && !im.cref?.[k]) continue;
+        im[k] = cloudBin(ref, im.id, k); freed += ref.size || 0;
+      }
+      if (freed){ await save('images', im); n++; bytes += freed; }
+    }
+  } finally { OD.quiet--; }
+  if (!silent) toast(n ? `Liberados ${fmtMB(bytes)} en este dispositivo (${n} fotos). Siguen en tu OneDrive y se descargan al abrirlas.` : 'No hay fotos que liberar: todo lo de este dispositivo se ha abierto hace poco o aún no está en la nube.');
+  renderStore(); return n;
+}
+async function odAutoFree(){
+  try { const e = await navigator.storage?.estimate?.(); if (e?.quota && e.usage / e.quota > .6) await odFreeSpace(30, true); } catch {}
+}
 function odSignIn(){
   if (!odReady()) return toast('OneDrive funciona en la app instalada desde tu web, no dentro de claude.ai.');
   if (VAULT.key) return odConnect();
@@ -2331,7 +2392,7 @@ function imageDetail(im){
       <div class="btns"><button class="btn sm${isVid ? ' primary' : ''}" type="button" id="dExpO">${isVid ? 'Descargar vídeo' : 'Descargar original'}</button>${im.edited ? '<button class="btn sm" type="button" id="dExpE">Descargar editada</button>' : ''}</div>
       <div class="btns"><button class="btn sm" type="button" id="dCmp">Comparar con…</button><button class="btn sm danger" type="button" id="dDel">Eliminar</button><button class="btn sm" type="button" id="dClose">Cerrar</button></div>
     </div></div>`, true);
-  const persist = async () => { const upd = {...im, consent: $('#dConsent').checked, notes: $('#dNotes').value}; Object.assign(im, upd); await save('images', im); };
+  const persist = async () => { const c = $('#dConsent').checked, n = $('#dNotes').value; if (!!im.consent === c && (im.notes || '') === n) return; Object.assign(im, {consent: c, notes: n}); await save('images', im); };
   $('#dType').onchange = async () => { await persist(); await assignType(im, $('#dType').value); }; $('#dConsent').onchange = persist; $('#dNotes').onchange = persist;
   if (im.edited){
     $('#dEd').onclick = () => { showEdited = true; $('#dImg').src = src(); $('#dEd').setAttribute('aria-pressed', true); $('#dOr').setAttribute('aria-pressed', false); };
@@ -2582,19 +2643,21 @@ async function odFreshReturn(){
     const raw = await freshPassword(el, rec);
     lockMsg(el, 'Cargando tus pacientes…', 'Descifrando');
     await adoptVault(rec, raw); raw.fill(0);
-    const m = JSON.parse(td.decode(await openSealedFile(file, start, VAULT.key)));
-    await DB.put('meta', {id: 'odSeen', value: {[rows.at(0).dev]: rows.at(0).at}}).catch(() => {});
+    lockMsg(el, 'Cargando tus pacientes…', 'Leyendo la lista');
+    const {m, hashes} = await odReadCopy(file, VAULT.key);
+    await DB.put('meta', {id: 'odSeen', value: {[rows.at(0).dev]: {at: rows.at(0).at, hashes}}}).catch(() => {});
     L.tombs = {...(m.tombs || {}), ...(L.tombs || {})};
     if (m.prefs?.odClientId && !PREFS.odClientId){ PREFS.odClientId = m.prefs.odClientId; savePrefs(); }
     el.remove(); try { localStorage.setItem('ec-welcome', '1'); } catch {}
-    // this device's own example case gives way to the account's data (which carries its own example if kept)
-    for (const sp of L.patients.filter(x => x.sample)){
+    // this device's own example case gives way to the account's data
+    OD.quiet = (OD.quiet || 0) + 1;
+    try { for (const sp of L.patients.filter(x => x.sample)){
       const cs = L.cases.filter(c => c.patientId === sp.id), cids = new Set(cs.map(c => c.id));
       for (const im of L.images.filter(i => cids.has(i.caseId))) await remove('images', im.id);
       for (const x of L.sessions.filter(x => cids.has(x.caseId))) await remove('sessions', x.id);
       for (const c of cs) await remove('cases', c.id);
       await remove('patients', sp.id);
-    }
+    } } finally { OD.quiet--; }
     const hadOwn = L.patients.some(p => !p.sample && alive(p));
     await restoreV2(m, VAULT.key, m.patients.filter(p => !p.trashed).map(p => p.id), true);
     if (hadOwn) setTimeout(() => odBackupNow(true), 2500);
@@ -2662,6 +2725,33 @@ async function unpackBin(blob, key){
 }
 async function retry(fn, n = 4){ for (let i = 0; ; i++){ try { return await fn(); } catch (e){ if (i >= n - 1 || e.code === 'not_connected' || e.code === 'expired' || e.status === 403 || e.status === 507) throw e; await new Promise(z => setTimeout(z, 1200 * 2 ** i)); } } }
 async function pool(items, n, fn){ let i = 0; const run = async () => { while (i < items.length && !OD.cancel){ const it = items[i++]; await fn(it); } }; await Promise.all(Array.from({length: Math.min(n, items.length)}, run)); }
+const shaHex = async t => [...new Uint8Array(await crypto.subtle.digest('SHA-256', te.encode(t)))].map(b => b.toString(16).padStart(2, '0')).join('');
+/* read a cloud copy (v2: one file; v3: an index + one piece per patient). With prevHashes, only pieces that changed are fetched */
+async function odReadCopy(src, key = VAULT.key, prevHashes = null){
+  const file = src instanceof Blob ? src : new File([await odGetFile(src)], 'm.psb'), {start, rec} = await readSealedHeader(file);
+  let ix; try { ix = JSON.parse(td.decode(await openSealedFile(file, start, key))); } catch (e){ throw Object.assign(new Error('Esta copia es de otra contraseña'), {foreign: true, rec}); }
+  if (!ix.shards) return {m: ix, hashes: null};
+  const m = {...ix, patients: [], cases: [], sessions: [], images: [], perio: [], posts: [], fonts: [], tombs: {}};
+  const keys = Object.keys(ix.shards).filter(k => !prevHashes || prevHashes[k] !== ix.shards[k].hash);
+  await pool(keys, 4, async k => {
+    const f = new File([await odGetFile(ix.shards[k].name)], 's.psb'), h = await readSealedHeader(f), o = JSON.parse(td.decode(await openSealedFile(f, h.start, key)));
+    if (k === '_global'){ m.posts = o.posts || []; m.brand = o.brand; m.fonts = o.fonts || []; m.tombs = o.tombs || {}; m.hasGlobal = true; }
+    else for (const st of ['patients', 'cases', 'sessions', 'images', 'perio']) m[st].push(...(o[st] || []));
+  });
+  return {m, hashes: Object.fromEntries(Object.entries(ix.shards).map(([k, v]) => [k, v.hash]))};
+}
+/* a photo record from the cloud: only its miniature is downloaded now; the rest stays a cloud reference until opened */
+async function imageFromRemote(im, cur, key = VAULT.key){
+  const rec = {...im}; delete rec.bins; rec.cref = {};
+  for (const [k, b] of Object.entries(im.bins || {})){
+    const ref = {name: b.name, size: b.size || 0};
+    const have = cur && cur[k] && !cur[k].__cloudRef ? cur[k] : null;
+    if (have && (k === 'original' || cur.cref?.[k]?.name === ref.name || (k !== 'thumb' && verOf(cur) >= verOf(im)))){ rec[k] = have; rec.cref[k] = ref; continue; }
+    if (k === 'thumb'){ rec[k] = await unpackBin(await odGetFile(ref.name), key); rec.cref[k] = ref; continue; }
+    rec[k] = cloudBin(ref, im.id, k);
+  }
+  return rec;
+}
 async function odPut(path, blob){
   if (blob.size <= 4 * 1048576) return retry(() => odFetch(`/me/drive/special/approot:/${odPath(path)}:/content`, {method: 'PUT', headers: {'Content-Type': 'application/octet-stream'}, body: blob}));
   return retry(() => odUpload(blob, path));
@@ -2693,11 +2783,18 @@ async function odBackupNow(auto){
     const dev = await odDev(), base = `v2/${dev}`, now = Date.now();
     const idx = (await DB.get('meta', 'odIndex').catch(() => null))?.value || {names: {}, manifests: []};
     const jobs = [], images = [];
+    const sampleP = new Set(L.patients.filter(p => p.sample).map(p => p.id)), sampleC = new Set(L.cases.filter(c => sampleP.has(c.patientId)).map(c => c.id));
     for (const im of L.images){
-      const meta = {...im}; for (const k of ['original', 'edited', 'thumb', 'mask', 'base']) delete meta[k]; meta.bins = {};
+      if (im.sample || sampleC.has(im.caseId)) continue;
+      const meta = {...im}; for (const k of ['original', 'edited', 'thumb', 'mask', 'base', 'cref']) delete meta[k]; meta.bins = {};
       for (const k of ['original', 'edited', 'thumb', 'mask', 'base']){ const v = im[k]; if (!v) continue;
+        const cref = v.__cloudRef || im.cref?.[k];
+        if (cref){ meta.bins[k] = {name: cref.name, size: cref.size}; if (idx.names[cref.name]) idx.names[cref.name].ref = now; continue; }
+        // already uploaded by this device and not edited since: same file, whatever the local encryption looks like now
+        const own = idx.own?.[im.id]?.[k], sz = v.size ?? v.byteLength ?? 0;
+        if (own && idx.names[own.name] && (own.bv || 0) === (im.binv || 0) && (own.raw == null || own.raw === sz)){ meta.bins[k] = {name: own.name, size: own.size}; idx.names[own.name].ref = now; continue; }
         const sb = v.__lazy ? asBlobParts(v.sealed) : await sealBin(v), name = `${base}/b/${im.id}.${k}.${binTag(sb)}.bin`;
-        meta.bins[k] = {name, size: sb.size};
+        meta.bins[k] = {name, size: sb.size}; (idx.own = idx.own || {})[im.id] = {...(idx.own[im.id] || {}), [k]: {name, size: sb.size, bv: im.binv || 0, raw: v.size ?? v.byteLength ?? 0}};
         if (idx.names[name]) idx.names[name].ref = now; else jobs.push({name, sb}); }
       images.push(meta);
     }
@@ -2719,10 +2816,27 @@ async function odBackupNow(auto){
     });
     await DB.put('meta', {id: 'odIndex', value: idx}).catch(() => {});
     if (OD.cancel){ toast(`Copia detenida: ${done} de ${jobs.length} archivos subidos. La próxima vez continúa donde se quedó.`); return; }
-    const strip = (k, v) => isBin(v) ? null : v;
-    const manifest = {app: 'Smilebook', version: 2, dev, device: devLabel(), exportedAt: new Date(now).toISOString(), patients: L.patients, cases: L.cases, sessions: L.sessions, images, posts: L.posts, perio: L.perio, brand: IG.brand, prefs: PREFS, fonts, tombs: L.tombs || {}};
+    const strip = (k, v) => k === 'cref' ? undefined : v && v.__cloudRef ? null : isBin(v) ? null : v;
+    // one small encrypted piece per patient: a change to one patient uploads only that patient's piece
+    const caseP = new Map(L.cases.map(c => [c.id, c.patientId])), groups = new Map();
+    const grp = k => { k = k || '_sueltos'; if (!groups.has(k)) groups.set(k, {patients: [], cases: [], sessions: [], images: [], perio: []}); return groups.get(k); };
+    for (const x of L.patients) if (!sampleP.has(x.id)) grp(x.id).patients.push(x);
+    for (const x of L.cases) if (!sampleP.has(x.patientId)) grp(x.patientId).cases.push(x);
+    for (const x of L.sessions) if (!sampleC.has(x.caseId)) grp(caseP.get(x.caseId)).sessions.push(x);
+    for (const x of images) grp(caseP.get(x.caseId)).images.push(x);
+    for (const x of L.perio) if (!sampleP.has(x.patientId)) grp(x.patientId).perio.push(x);
+    groups.set('_global', {posts: L.posts, brand: IG.brand, fonts, tombs: L.tombs || {}});
+    const shards = {}, sjobs = [];
+    for (const [key, obj] of groups){
+      const json = JSON.stringify(obj, strip), hash = (await shaHex(json)).slice(0, 24), name = `${base}/s/${String(key).replace(/[^\w-]/g, '_')}.${hash}.psb`;
+      shards[key] = {name, hash};
+      if (idx.names[name]) idx.names[name].ref = now; else sjobs.push({name, json});
+    }
+    await pool(sjobs, 3, async j => { const sb = await sealFile(new Blob([j.json], {type: 'application/json'})); await odPut(j.name, sb); idx.names[j.name] = {size: sb.size, ref: now}; });
+    if (OD.cancel) return;
+    const manifest = {app: 'Smilebook', version: 3, dev, device: devLabel(), exportedAt: new Date(now).toISOString(), prefs: PREFS, shards};
     const mname = `${base}/m/manifest_${new Date(now).toISOString().replace(/[:.]/g, '-')}.psb`;
-    await odPut(mname, await sealFile(new Blob([JSON.stringify(manifest, strip)], {type: 'application/json'})));
+    await odPut(mname, await sealFile(new Blob([JSON.stringify(manifest)], {type: 'application/json'})));
     idx.manifests.push({name: mname, at: now});
     // keep the last 10 copies; a binary no kept copy refers to is deleted
     const drop = idx.manifests.slice(0, Math.max(0, idx.manifests.length - OD.keep)); idx.manifests = idx.manifests.slice(-OD.keep);
@@ -2761,7 +2875,7 @@ async function odRestorePick(){
         if (r.kind === 1){ closeDialog(null); return restore(file); }
         const {start, rec} = await readSealedHeader(file); closeDialog(null);
         const key = await askBackupKey(rec); if (!key) return;
-        const m = JSON.parse(td.decode(await openSealedFile(file, start, key)));
+        toast('Leyendo la copia…'); const {m} = await odReadCopy(file, key);
         pickPatients(m, key);
       } catch (e){ b.disabled = false; b.textContent = 'Abrir'; toast('No se pudo abrir la copia: ' + e.message); }
     });
@@ -2796,14 +2910,12 @@ async function restoreV2(m, key, pids, all){
     for (const x of (m.perio || []).filter(e => sel.has(e.patientId))) await save('perio', x);
     if (all){ for (const x of m.posts || []) await save('posts', x); if (m.brand){ Object.assign(IG.brand, m.brand); await DB.put('meta', {id: 'brand', value: IG.brand}); IG.logoImg = null; } }
     const todo = imgs.filter(im => { const cur = L.images.find(x => x.id === im.id); return !cur || (cur.updatedAt || 0) < (im.updatedAt || 0) || !cur.original; });
-    const need = todo.reduce((a, im) => a + Object.values(im.bins || {}).reduce((s2, b) => s2 + b.size, 0), 0);
+    const need = todo.reduce((a, im) => a + (im.bins?.thumb?.size || 0), 0);
     let done = 0, bytes = 0, missing = 0; const t0 = Date.now();
-    const show = () => odBar(`Restaurando · ${done} de ${todo.length} archivos · ${fmtMB(bytes)} de ${fmtMB(need)}`, need ? bytes / need : 1);
+    const show = () => odBar(`Cargando miniaturas · ${done} de ${todo.length} fotos`, todo.length ? done / todo.length : 1);
     show();
     await pool(todo, 3, async im => {
-      const rec = {...im}; delete rec.bins;
-      try { for (const [k, b] of Object.entries(im.bins || {})){ rec[k] = await unpackBin(await odGetFile(b.name), key); bytes += b.size; } }
-      catch { missing++; done++; show(); return; }
+      let rec; try { rec = await imageFromRemote(im, L.images.find(x => x.id === im.id), key); } catch { missing++; done++; show(); return; }
       if (!rec.original){ missing++; done++; show(); return; }
       await save('images', rec); done++; show();
     });
@@ -2811,7 +2923,7 @@ async function restoreV2(m, key, pids, all){
       try { const data = await unpackBin(await odGetFile(f.name), key), r = {id: f.id, family: f.family, weight: f.weight, style: f.style, file: f.file, data: data instanceof ArrayBuffer ? data : data.buffer}; if (await registerUserFont(r)) USER_FONTS.push(r); } catch {} }
       await DB.put('meta', {id: 'fonts', value: USER_FONTS}).catch(() => {}); }
     renderLib();
-    toast(OD.cancel ? `Restauración detenida: ${done} de ${todo.length} archivos. Vuelve a restaurar para completar.` : `Restaurados ${pids.length} paciente(s): ${done - missing} archivos${missing ? `, ${missing} no se encontraron en la nube` : ''}.`);
+    toast(OD.cancel ? `Restauración detenida: ${done} de ${todo.length} archivos. Vuelve a restaurar para completar.` : `Restaurados ${pids.length} paciente(s): ${done - missing} fotos${missing ? `, ${missing} no se encontraron en la nube` : ''}. Las fotos en alta resolución se descargan al abrirlas.`);
   } catch (e){ toast('No se pudo restaurar: ' + e.message); }
   finally { OD.busy = false; OD.cancel = false; OD.restoring = false; odBar(null); }
 }
@@ -2847,13 +2959,13 @@ async function odPull(){
     const newest = new Map();
     for (const r of await odManifestRows()) if (r.dev !== me && !newest.has(r.dev)) newest.set(r.dev, r);
     for (const [dev, r] of newest){
-      if (seen[dev] && seen[dev] >= r.at) continue;
-      const file = new File([await odGetFile(r.path)], 'm.psb'), {start} = await readSealedHeader(file);
-      let m; try { m = JSON.parse(td.decode(await openSealedFile(file, start, VAULT.key))); }
-      catch { seen[dev] = r.at; OD.foreign = true; continue; }   // a device with another password: skipped (its copy stays in the cloud)
-      const n = await odMerge(m);
-      if (n){ changed += n; from.add(m.device || 'otro dispositivo'); }
-      seen[dev] = r.at;
+      const sv = typeof seen[dev] === 'string' ? {at: seen[dev]} : seen[dev] || {};
+      if (sv.at && sv.at >= r.at) continue;
+      let got; try { got = await odReadCopy(r.path, VAULT.key, sv.hashes || null); }
+      catch (e){ if (e.foreign){ OD.foreign = {dev, rec: e.rec}; renderStore(); continue; } throw e; }   // another password: offered to join (see odJoin)
+      const n = await odMerge(got.m);
+      if (n){ changed += n; from.add(got.m.device || 'otro dispositivo'); }
+      seen[dev] = {at: r.at, hashes: got.hashes};
       await DB.put('meta', {id: 'odSeen', value: seen});
     }
   } finally { OD.busy = false; }
@@ -2887,8 +2999,7 @@ async function odMerge(m){
     const editing = currentView() === 'ed' && E.current && snapshot() !== E.baseline ? E.current.id : null;
     const todo = (m.images || []).filter(im => im?.id && !im.sample && !sc.has(im.caseId) && im.id !== editing && (L.tombs[im.id] || 0) < verOf(im) && (() => { const cur = L.images.find(x => x.id === im.id); return !cur || verOf(im) > verOf(cur) || !cur.original; })());
     await pool(todo, 3, async im => {
-      const rec = {...im}; delete rec.bins;
-      try { for (const [k, b] of Object.entries(im.bins || {})) rec[k] = await unpackBin(await odGetFile(b.name), VAULT.key); } catch { return; }
+      let rec; try { rec = await imageFromRemote(im, L.images.find(x => x.id === im.id)); } catch { return; }
       if (!rec.original) return;
       await save('images', rec); n++;
     });
@@ -2926,7 +3037,7 @@ function odGuide(){
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)){ $('#gErr').textContent = 'No parece un Id. válido: son 36 caracteres con guiones, como 1a2b3c4d-…'; return; }
     PREFS.odClientId = id; savePrefs(); closeDialog(true); odConnect(); };
 }
-async function odAutoBackup(){ if (await odLoadTok()){ OD.lastPull = Date.now(); return odSync(); } }
+async function odAutoBackup(){ if (await odLoadTok()){ OD.lastPull = Date.now(); await odSync(); setTimeout(odAutoFree, 20000); } }
 /* the sidebar button copies to OneDrive; downloading a file to this computer stays as a manual option in Preferences */
 $('#backupBtn').onclick = async () => {
   if (VAULT.key && odReady() && await odLoadTok()) return odBackupNow(false);
@@ -2960,6 +3071,7 @@ function crumbFor(im){
   return `${esc(p?.name || '')} › ${esc(c?.title || '')} › ${esc(s?.label || '')} · <b>${esc(TYPE_NAME[im.type] || 'Imagen')}</b>`;
 }
 async function openArchived(im){
+  markOpened(im.id);
   if (im.kind === 'video' || im.kind === 'file') return imageDetail(im);
   try {
     const img = await blobToImage(im.base || im.original);
@@ -4296,6 +4408,8 @@ async function engineLoad(im){
 async function renderAndStore(im){
   const needsAlpha = S.bg === 'transparent' && (!S.maskEmpty || !rectInside(S.crop.x + S.crop.w/2, S.crop.y + S.crop.h/2, S.crop.w, S.crop.h));
   const fmt = needsAlpha ? 'png' : 'jpg', res = await renderOutput(0, fmt, .93), t = await makeThumb(res.blob);
+  if (im.cref) for (const k of ['edited', 'thumb', 'mask']) delete im.cref[k];
+  im.binv = (im.binv || 0) + 1;   // its pictures changed: the cloud copy of them is out of date
   Object.assign(im, {recipe: getRecipe(), mask: S.maskEmpty ? null : S.mask.slice(), edited: res.blob, editedFmt: fmt, thumb: t.blob, updatedAt: Date.now()});
   await save('images', im);
 }
@@ -4829,7 +4943,7 @@ async function bakeCrop(){
     if (keep.bg !== 'transparent') setBg(keep.bg, true);
     S.cal = null; histReset(); req('mask', 'adj');
     if (im){
-      im.base = res.blob; await renderAndStore(im); E.baseline = snapshot(); DB.del('drafts', im.id).catch(() => {}); bakeUI();
+      im.base = res.blob; if (im.cref) delete im.cref.base; await renderAndStore(im); E.baseline = snapshot(); DB.del('drafts', im.id).catch(() => {}); bakeUI();
       toastAction('Recorte aplicado: es la nueva versión de la foto.', 'Deshacer', async () => {
         Object.assign(im, prev, {updatedAt: Date.now()}); if (!prev.base) delete im.base; await save('images', im); openArchived(im); });
     } else toast('Recorte aplicado.');
@@ -4840,6 +4954,8 @@ async function unbakeCrop(){
   const im = E.current; if (!im?.base) return;
   if (!await confirmDlg('¿Volver a la foto original?', 'Se quita el recorte aplicado y vuelves a la foto completa de la cámara.', 'Volver al original', false)) return;
   delete im.base; im.recipe = null; im.mask = null; im.edited = null; im.thumb = (await makeThumb(await realBlob(im.original))).blob;
+  if (im.cref) for (const k of ['base', 'edited', 'thumb', 'mask']) delete im.cref[k];
+  im.binv = (im.binv || 0) + 1;
   im.updatedAt = Date.now(); await save('images', im); openArchived(im); toast('Has vuelto a la foto original.');
 }
 $('#bakeBtn').onclick = bakeCrop;
@@ -5970,6 +6086,7 @@ function openPrefs(tab = 'look'){
           <span class="btns">${VAULT.rec && !odReady() && !window.claude && /^https?:/.test(location.protocol) ? '<button class="btn sm primary" type="button" id="pfOdGuide">Conectar OneDrive</button>' : ''}${VAULT.rec && odReady() ? (OD.tok ? '<button class="btn sm primary" type="button" id="pfOdUp">Copiar ahora</button><button class="btn sm" type="button" id="pfOdRe">Restaurar…</button><button class="btn sm ghost danger" type="button" id="pfOdOff">Desconectar</button>' : '<button class="btn sm primary" type="button" id="pfOdOn">Conectar OneDrive</button>') : ''}</span></div>
         ${VAULT.rec ? `<div class="prow"><span>Id. de aplicación de Microsoft<small>El código que te da Microsoft al registrar Smilebook (portal.azure.com › Registros de aplicaciones). No es secreto.</small></span><input type="text" id="pfOdId" value="${esc(PREFS.odClientId || '')}" placeholder="00000000-0000-0000-0000-000000000000" spellcheck="false" style="max-width:300px;font-family:var(--font-mono);font-size:12px"></div>
         <div class="prow"><span>Copia automática en OneDrive<small>Al abrir la app y a los pocos minutos de cada cambio. Solo sube lo nuevo, cifrado.</small></span><input type="checkbox" class="switch" id="pfOdAuto" ${PREFS.odAuto !== false ? 'checked' : ''}></div>` : ''}
+        ${VAULT.rec && OD.tok ? `<div class="prow"><span>Espacio en este dispositivo<small>Las fotos que ya están en tu OneDrive y no has abierto en 30 días se quitan de aquí (queda la miniatura) y se descargan solas al abrirlas. Se hace solo si el dispositivo se llena.</small></span><button class="btn sm" type="button" id="pfFree">Liberar espacio ahora</button></div>` : ''}
         <div class="prow"><span>Papelera<small>Se vacía sola a los 30 días.</small></span><button class="btn sm" type="button" id="pfTrash">Abrir papelera</button></div>
         <div class="prow"><span>Privacidad<small>Todo se guarda y procesa en este dispositivo. Al exportar se eliminan los metadatos EXIF y la ubicación. Las fotos y los casos que descargas sueltos salen sin cifrar, para poder enviarlos.</small></span></div>
       </div>`
@@ -6014,6 +6131,7 @@ function openPrefs(tab = 'look'){
     $('#pfOdOff') && ($('#pfOdOff').onclick = async () => { await odSaveTok(null); openPrefs('data'); toast('OneDrive desconectado. Las copias siguen en tu OneDrive.'); });
     $('#pfPw') && ($('#pfPw').onclick = () => changePassword());
     $('#pfLockNow') && ($('#pfLockNow').onclick = () => lockNow());
+    $('#pfFree') && ($('#pfFree').onclick = () => odFreeSpace(30));
     $('#pfLockMin') && ($('#pfLockMin').onchange = e => { PREFS.lockMin = +e.target.value; savePrefs(); resumeTouch(true); });
     $('#pfRestore').onclick = () => { closeDialog(null); $('#zipInput').click(); };
     $('#pfTrash').onclick = () => { closeDialog(null); showTrash(); };
@@ -6695,10 +6813,11 @@ async function rescueOffer(){
 }
 function askBackupRaw(rec){
   return new Promise(res => {
-    openDialog(`<h3>Contraseña de esa copia</h3><p class="hint">La contraseña (o la clave de recuperación) que usabas cuando hiciste la copia.</p>
+    openDialog(`<h3>Contraseña de esos datos</h3><p class="hint">La contraseña (o la clave de recuperación) que se usaba en el otro dispositivo o cuando se hizo la copia. Solo se pide una vez.</p>
       <input type="password" id="brIn" autocomplete="off"><p class="lockerr" id="brErr"></p>
       <div class="foot"><button class="btn" type="button" id="brNo">Cancelar</button><button class="btn primary" type="button" id="brGo">Recuperar</button></div>`);
     $('#brNo').onclick = () => { closeDialog(null); res(null); };
+    $('#brIn').focus();
     $('#brGo').onclick = async () => { const v = $('#brIn').value.trim();
       for (const mode of ['pw', 'rec']){ try { const raw = await unwrapWith(rec, v, mode); closeDialog(true); return res(raw); } catch {} }
       $('#brErr').textContent = 'No es correcta.'; };

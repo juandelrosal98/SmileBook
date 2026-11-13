@@ -1,6 +1,6 @@
 // Smilebook offline cache: the page always comes from the web when there is connection (so a reload is always
 // the latest version) and from this cache when offline; a new version takes over at once
-const CACHE = 'smilebook-1.6.0-1794611311972', SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png'];
+const CACHE = 'smilebook-1.7.0-1794614057635', SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png'];
 // a new version installs alongside the old one and waits; the page shows "Actualizar" and asks it to take over
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL.map(u => new Request(u, {cache: 'reload'})))).then(() => self.skipWaiting())); });
 self.addEventListener('message', e => { if (e.data?.type === 'skip-waiting') self.skipWaiting(); });
