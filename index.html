@@ -1532,7 +1532,7 @@ async function openSealedFile(f, start, key){
     out.push(await aesOpen(key, {iv, ct: await f.slice(o + 16, o + 16 + len).arrayBuffer()})); o += 16 + len; }
   return new Blob(out).arrayBuffer();
 }
-const APP_VERSION = '1.5.2';
+const APP_VERSION = '1.6.0';
 /* the installed app announces a downloaded update; one tap swaps it in (after pending saves) and reloads */
 addEventListener('ps-update', e => {
   if ($('#updBar')) return;
@@ -1579,14 +1579,19 @@ const DB = {
   rawPut(s, o){ return this.tx(s, 'readwrite', os => os.put(o)); }
 };
 const L = {patients:[], cases:[], sessions:[], images:[], posts:[], perio:[], sel:null, q:'', filter:'all', persistent:false, lastBackup:null, ok:true, selImgs:new Set(), anchor:null, target:null, clip:null};
+const SYNCED = new Set(['patients', 'cases', 'sessions', 'images', 'perio', 'posts']);
+const verOf = r => r?.mt || r?.updatedAt || r?.createdAt || 0;
 async function save(store, obj){
+  if (SYNCED.has(store) && !(typeof OD !== 'undefined' && OD.restoring)) obj.mt = Date.now();
   const arr = L[store];
   if (Array.isArray(arr)){ const i = arr.findIndex(x => x.id === obj.id); if (i >= 0) arr[i] = obj; else arr.push(obj); }
   try { await DB.put(store, obj); } catch (e){ toast('No se pudo guardar en este navegador: ' + (e?.message || e)); }
   requestPersist();
   if (['patients', 'cases', 'sessions', 'images', 'perio', 'posts'].includes(store) && typeof odDirty === 'function') odDirty();
 }
-async function remove(store, id){ L[store] = L[store].filter(x => x.id !== id); try { await DB.del(store, id); } catch {} }
+async function remove(store, id){
+  if (SYNCED.has(store)){ L.tombs = L.tombs || {}; L.tombs[id] = Date.now(); DB.put('meta', {id: 'tombs', value: L.tombs}).catch(() => {}); if (typeof odDirty === 'function') odDirty(); }
+  L[store] = L[store].filter(x => x.id !== id); try { await DB.del(store, id); } catch {} }
 async function requestPersist(){
   if (L.persistent || !navigator.storage?.persist) return;
   try { L.persistent = await navigator.storage.persist(); } catch {}
@@ -1993,19 +1998,29 @@ async function renderStore(){
   else if (L.lastBackup && Date.now() - L.lastBackup > 7*864e5 && nImg) warn = `<span class="warn">Tu última copia tiene más de una semana.</span>`;
   const ago = t => { const m = Math.round((Date.now() - t) / 60000); return m < 1 ? 'ahora mismo' : m < 60 ? `hace ${m} min` : m < 1440 ? `hace ${Math.round(m / 60)} h` : `hace ${Math.round(m / 1440)} días`; };
   const od = !odWeb() ? '' : OD.tok
-    ? `<div class="odcard on"><div class="odhead">${OD_ICON}<span><b>OneDrive conectado</b><small>${esc(OD.tok.user || '')}${L.lastCloud ? ` · copia ${ago(L.lastCloud)}` : ''}</small></span></div>
-       <div class="odbtns"><button type="button" id="odSideUp">${OD.busy ? 'Guardando…' : 'Guardar ahora'}</button><button type="button" id="odSideRe">Cargar copia</button></div></div>`
+    ? `<div class="odcard on"><div class="odhead">${OD_ICON}<span><b>${odStateText(ago)}</b><small>${esc(OD.tok.user || '')}</small></span></div>
+       <div class="odbtns"><button type="button" id="odSideUp">${OD.state === 'expired' ? 'Iniciar sesión' : OD.busy ? 'Guardando…' : 'Guardar ahora'}</button><button type="button" id="odSideRe">Cargar copia</button></div></div>`
     : `<div class="odcard"><button type="button" class="odsign" id="odSideIn">${OD_ICON}<span>Iniciar sesión en OneDrive<small>Tus pacientes se guardan solos en tu nube</small></span></button></div>`;
   if (warn && OD.tok && /copia/.test(warn)) warn = '';
   $('#storeInfo').innerHTML = od + `<div class="storerow"><span>En este navegador</span><b>${fmtMB(used)}</b></div><div class="gauge" title="${pct.toFixed(1).replace('.', ',')} % del espacio disponible"><i style="width:${Math.max(.5, pct)}%"></i></div>${warn ? `<div class="storerow">${warn}</div>` : ''}<div class="storerow" style="opacity:.55;font-size:11px"><span>Smilebook ${APP_VERSION}</span></div>`;
   $('#encLink')?.addEventListener('click', () => enableVault());
   $('#odSideIn')?.addEventListener('click', odSignIn);
-  $('#odSideUp')?.addEventListener('click', () => { if (!OD.busy) odBackupNow(false); });
+  $('#odSideUp')?.addEventListener('click', () => { if (OD.state === 'expired') return odConnect(); if (!OD.busy) odBackupNow(false); });
   $('#odSideRe')?.addEventListener('click', () => odRestorePick());
+}
+function odStateText(ago){
+  const st = OD.state || 'ok';
+  if (st === 'saving') return 'Guardando en OneDrive…';
+  if (st === 'pending') return 'Cambios por guardar…';
+  if (st === 'offline') return 'Sin conexión · se guardará al volver';
+  if (st === 'expired') return 'Vuelve a iniciar sesión en OneDrive';
+  if (st === 'error') return 'No se pudo guardar · reintentando';
+  return L.lastCloud ? `Guardado en OneDrive · ${ago(L.lastCloud)}` : 'OneDrive conectado';
 }
 const OD_ICON = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 18.5h10.5a4 4 0 0 0 .6-7.95A5.5 5.5 0 0 0 7.6 9.2 4.66 4.66 0 0 0 7 18.5z"/></svg>';
 /* one button for everything: with a password already, connect and copy (or load, on an empty device);
    on a device with no password yet, sign in first: if the cloud holds data, it loads with the account's password */
+setInterval(() => { if (OD.tok && currentView() === 'lib' && document.visibilityState === 'visible') renderStore(); }, 60 * 1000);
 function odSignIn(){
   if (!odReady()) return toast('OneDrive funciona en la app instalada desde tu web, no dentro de claude.ai.');
   if (VAULT.key) return odConnect();
@@ -2568,6 +2583,8 @@ async function odFreshReturn(){
     lockMsg(el, 'Cargando tus pacientes…', 'Descifrando');
     await adoptVault(rec, raw); raw.fill(0);
     const m = JSON.parse(td.decode(await openSealedFile(file, start, VAULT.key)));
+    await DB.put('meta', {id: 'odSeen', value: {[rows.at(0).dev]: rows.at(0).at}}).catch(() => {});
+    L.tombs = {...(m.tombs || {}), ...(L.tombs || {})};
     if (m.prefs?.odClientId && !PREFS.odClientId){ PREFS.odClientId = m.prefs.odClientId; savePrefs(); }
     el.remove(); try { localStorage.setItem('ec-welcome', '1'); } catch {}
     // this device's own example case gives way to the account's data (which carries its own example if kept)
@@ -2692,16 +2709,18 @@ async function odBackupNow(auto){
     let done = 0, bytes = 0, lastSave = Date.now(); const t0 = Date.now();
     const show = () => { const el = (Date.now() - t0) / 1000, rate = bytes / Math.max(1, el), left = rate ? (need - bytes) / rate : 0;
       odBar(`OneDrive · ${done} de ${jobs.length} archivos · ${fmtMB(bytes)} de ${fmtMB(need)}${left > 90 ? ` · quedan ~${left > 5400 ? Math.round(left / 3600) + ' h' : Math.round(left / 60) + ' min'}` : ''}`, need ? bytes / need : 1); };
-    if (jobs.length) show(); else if (!auto) odBar('OneDrive · comprobando cambios…', 1);
+    const quiet = auto && need < 8e6;
+    if (jobs.length && !quiet) show(); else if (!auto) odBar('OneDrive · comprobando cambios…', 1);
+    OD.state = 'saving'; renderStore();
     await pool(jobs, 3, async j => {
       await odPut(j.name, packBin(j.sb));
-      idx.names[j.name] = {size: j.sb.size, ref: now}; done++; bytes += j.sb.size; show();
+      idx.names[j.name] = {size: j.sb.size, ref: now}; done++; bytes += j.sb.size; if (!quiet) show();
       if (Date.now() - lastSave > 15000){ lastSave = Date.now(); await DB.put('meta', {id: 'odIndex', value: idx}).catch(() => {}); }
     });
     await DB.put('meta', {id: 'odIndex', value: idx}).catch(() => {});
     if (OD.cancel){ toast(`Copia detenida: ${done} de ${jobs.length} archivos subidos. La próxima vez continúa donde se quedó.`); return; }
     const strip = (k, v) => isBin(v) ? null : v;
-    const manifest = {app: 'Smilebook', version: 2, dev, device: devLabel(), exportedAt: new Date(now).toISOString(), patients: L.patients, cases: L.cases, sessions: L.sessions, images, posts: L.posts, perio: L.perio, brand: IG.brand, prefs: PREFS, fonts};
+    const manifest = {app: 'Smilebook', version: 2, dev, device: devLabel(), exportedAt: new Date(now).toISOString(), patients: L.patients, cases: L.cases, sessions: L.sessions, images, posts: L.posts, perio: L.perio, brand: IG.brand, prefs: PREFS, fonts, tombs: L.tombs || {}};
     const mname = `${base}/m/manifest_${new Date(now).toISOString().replace(/[:.]/g, '-')}.psb`;
     await odPut(mname, await sealFile(new Blob([JSON.stringify(manifest, strip)], {type: 'application/json'})));
     idx.manifests.push({name: mname, at: now});
@@ -2715,8 +2734,13 @@ async function odBackupNow(auto){
     L.lastCloud = now; L.lastBackup = now;
     await DB.put('meta', {id: 'lastCloud', value: now}); await DB.put('meta', {id: 'lastBackup', value: now}); renderStore();
     const total = Object.values(idx.names).reduce((a, v) => a + v.size, 0);
-    if (!auto || jobs.length) toast(`Copia en OneDrive al día: ${jobs.length ? `${jobs.length} archivos nuevos (${fmtMB(need)})` : 'sin cambios que subir'}. Tu archivo en la nube ocupa ${fmtMB(total)}.`);
-  } catch (e){ toast(e.code === 'not_connected' ? 'Conecta OneDrive en Preferencias › Datos.' : 'No se pudo completar la copia: ' + e.message + '. Vuelve a intentarlo: continúa donde se quedó.'); }
+    OD.state = 'ok'; OD.err = ''; renderStore();
+    if (!auto) toast(`Copia en OneDrive al día: ${jobs.length ? `${jobs.length} archivos nuevos (${fmtMB(need)})` : 'sin cambios que subir'}. Tu archivo en la nube ocupa ${fmtMB(total)}.`);
+  } catch (e){
+    OD.state = navigator.onLine === false ? 'offline' : e.code === 'expired' ? 'expired' : 'error'; OD.err = e.message; renderStore();
+    if (!auto) toast(e.code === 'not_connected' ? 'Conecta OneDrive en Preferencias › Datos.' : 'No se pudo completar la copia: ' + e.message + '. Vuelve a intentarlo: continúa donde se quedó.');
+    else { clearTimeout(OD.retryT); OD.retryT = setTimeout(() => odSync(), 2 * 60 * 1000); }
+  }
   finally { OD.busy = false; OD.cancel = false; odBar(null); }
 }
 async function odRestorePick(){
@@ -2791,12 +2815,94 @@ async function restoreV2(m, key, pids, all){
   } catch (e){ toast('No se pudo restaurar: ' + e.message); }
   finally { OD.busy = false; OD.cancel = false; OD.restoring = false; odBar(null); }
 }
-/* automatic cloud copy: on by default; runs when the app opens and 3 minutes after the last change */
+/* ===== automatic sync =====
+   Every change is uploaded ~20 s after the last edit (and when the app goes to the background or the connection
+   comes back). Every few minutes, and when the app comes to the front, the newest copy of each OTHER device is
+   read and merged: per record the most recent change wins, deletions travel as tombstones. */
 function odDirty(){
   if (OD.restoring) return;
   try { localStorage.setItem('ec-dirty', String(Date.now())); } catch {}
-  clearTimeout(OD.autoT); OD.autoT = setTimeout(odAutoBackup, 3 * 60 * 1000);
+  if (OD.tok){ OD.state = OD.state === 'saving' ? 'saving' : 'pending'; renderStore(); }
+  clearTimeout(OD.autoT); OD.autoT = setTimeout(() => odSync(), 20 * 1000);
 }
+const odOn = () => PREFS.odAuto !== false && !!VAULT.key && odReady() && !!OD.tok;
+async function odSync(opts = {}){
+  if (!odOn() || OD.busy || OD.syncing) return;
+  if (navigator.onLine === false){ OD.state = 'offline'; renderStore(); return; }
+  OD.syncing = true;
+  try {
+    if (opts.pull !== false) await odPull().catch(e => { OD.err = e.message; });
+    const last = L.lastCloud || 0; let dirty = 0; try { dirty = +localStorage.getItem('ec-dirty') || 0; } catch {}
+    if (dirty > last || (!last && L.patients.some(p => !p.sample))) await odBackupNow(true);
+    else if (OD.state !== 'error') { OD.state = 'ok'; renderStore(); }
+  } finally { OD.syncing = false; }
+}
+async function odPull(){
+  if (OD.busy) return;
+  OD.busy = true;
+  let changed = 0, from = new Set();
+  try {
+    await odAccess();
+    const me = await odDev(), seen = (await DB.get('meta', 'odSeen').catch(() => null))?.value || {};
+    const newest = new Map();
+    for (const r of await odManifestRows()) if (r.dev !== me && !newest.has(r.dev)) newest.set(r.dev, r);
+    for (const [dev, r] of newest){
+      if (seen[dev] && seen[dev] >= r.at) continue;
+      const file = new File([await odGetFile(r.path)], 'm.psb'), {start} = await readSealedHeader(file);
+      let m; try { m = JSON.parse(td.decode(await openSealedFile(file, start, VAULT.key))); }
+      catch { seen[dev] = r.at; OD.foreign = true; continue; }   // a device with another password: skipped (its copy stays in the cloud)
+      const n = await odMerge(m);
+      if (n){ changed += n; from.add(m.device || 'otro dispositivo'); }
+      seen[dev] = r.at;
+      await DB.put('meta', {id: 'odSeen', value: seen});
+    }
+  } finally { OD.busy = false; }
+  if (changed){
+    renderLib();
+    if (currentView() === 'perio' && typeof perioRender === 'function') perioRender();
+    toast(`Actualizado con ${changed} cambio${changed === 1 ? '' : 's'} hecho${changed === 1 ? '' : 's'} en ${[...from].join(', ')}.`);
+  }
+  return changed;
+}
+/* merge one device's copy into this one: newer record wins, tombstones delete, photos are fetched only when they changed */
+async function odMerge(m){
+  let n = 0; L.tombs = L.tombs || {};
+  // each device has its own example case: it never travels
+  const sp = new Set((m.patients || []).filter(p => p.sample).map(p => p.id)), sc = new Set((m.cases || []).filter(c => sp.has(c.patientId)).map(c => c.id));
+  const isSample = (st, r) => r.sample || (st === 'cases' && sp.has(r.patientId)) || (st === 'sessions' && sc.has(r.caseId)) || (st === 'perio' && sp.has(r.patientId));
+  OD.restoring = true;
+  try {
+    const tombs = m.tombs || {};
+    for (const [id, at] of Object.entries(tombs)){
+      if ((L.tombs[id] || 0) >= at) continue;
+      L.tombs[id] = at;
+      for (const st of SYNCED){ const cur = L[st].find(x => x.id === id); if (cur && verOf(cur) <= at){ L[st] = L[st].filter(x => x.id !== id); await DB.del(st, id).catch(() => {}); n++; } }
+    }
+    await DB.put('meta', {id: 'tombs', value: L.tombs}).catch(() => {});
+    for (const st of ['patients', 'cases', 'sessions', 'perio', 'posts']) for (const r of m[st] || []){
+      if (!r?.id || isSample(st, r) || (L.tombs[r.id] || 0) >= verOf(r)) continue;
+      const cur = L[st].find(x => x.id === r.id);
+      if (!cur || verOf(r) > verOf(cur)){ await save(st, r); n++; }
+    }
+    const editing = currentView() === 'ed' && E.current && snapshot() !== E.baseline ? E.current.id : null;
+    const todo = (m.images || []).filter(im => im?.id && !im.sample && !sc.has(im.caseId) && im.id !== editing && (L.tombs[im.id] || 0) < verOf(im) && (() => { const cur = L.images.find(x => x.id === im.id); return !cur || verOf(im) > verOf(cur) || !cur.original; })());
+    await pool(todo, 3, async im => {
+      const rec = {...im}; delete rec.bins;
+      try { for (const [k, b] of Object.entries(im.bins || {})) rec[k] = await unpackBin(await odGetFile(b.name), VAULT.key); } catch { return; }
+      if (!rec.original) return;
+      await save('images', rec); n++;
+    });
+  } finally { OD.restoring = false; }
+  return n;
+}
+// triggers: background, connection back, coming to the front, and a gentle timer while the app is open
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden'){ let dirty = 0; try { dirty = +localStorage.getItem('ec-dirty') || 0; } catch {} if (dirty > (L.lastCloud || 0)){ clearTimeout(OD.autoT); odSync({pull: false}); } }
+  else if (Date.now() - (OD.lastPull || 0) > 30 * 1000){ OD.lastPull = Date.now(); odSync(); }
+});
+addEventListener('online', () => setTimeout(() => odSync(), 1500));
+addEventListener('offline', () => { if (OD.tok){ OD.state = 'offline'; renderStore(); } });
+setInterval(() => { if (document.visibilityState === 'visible'){ OD.lastPull = Date.now(); odSync(); } }, 3 * 60 * 1000);
 /* one-time setup guide: what to do in Microsoft's portal, with this install's exact address to copy */
 function odGuide(){
   const uri = odRedirect();
@@ -2820,12 +2926,7 @@ function odGuide(){
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)){ $('#gErr').textContent = 'No parece un Id. válido: son 36 caracteres con guiones, como 1a2b3c4d-…'; return; }
     PREFS.odClientId = id; savePrefs(); closeDialog(true); odConnect(); };
 }
-async function odAutoBackup(){
-  if (PREFS.odAuto === false || !VAULT.key || !odReady() || OD.busy || !(await odLoadTok())) return;
-  const last = (await DB.get('meta', 'lastCloud').catch(() => null))?.value || 0;
-  let dirty = 0; try { dirty = +localStorage.getItem('ec-dirty') || 0; } catch {}
-  if ((dirty > last || Date.now() - last > 20 * 3600 * 1000) && L.patients.some(p => !p.sample)) odBackupNow(true);
-}
+async function odAutoBackup(){ if (await odLoadTok()){ OD.lastPull = Date.now(); return odSync(); } }
 /* the sidebar button copies to OneDrive; downloading a file to this computer stays as a manual option in Preferences */
 $('#backupBtn').onclick = async () => {
   if (VAULT.key && odReady() && await odLoadTok()) return odBackupNow(false);
@@ -6540,6 +6641,8 @@ async function boot(){
     for (const e of L.perio){ if (typeof e.date !== 'string') e.date = new Date(e.createdAt || Date.now()).toISOString().slice(0, 10); }
     const br = await DB.get('meta', 'brand'); if (br?.value) Object.assign(IG.brand, br.value);
     const lb = await DB.get('meta', 'lastBackup'); L.lastBackup = lb?.value || null;
+    try { L.tombs = (await DB.get('meta', 'tombs'))?.value || {}; const old = Date.now() - 365 * 864e5; for (const [k, v] of Object.entries(L.tombs)) if (v < old) delete L.tombs[k]; } catch { L.tombs = {}; }
+    try { L.lastCloud = (await DB.get('meta', 'lastCloud'))?.value || 0; } catch {}
     const seeded = await DB.get('meta', 'seeded');
     if (!seeded && !L.patients.length){ await seedExample(); await DB.put('meta', {id: 'seeded', value: true}); }
   } catch { if (!L.patients.length) await seedExample(); }
@@ -6559,7 +6662,7 @@ async function boot(){
   VAULT.onProgress = null; lockEl?.remove();
   BOOT.done = true;
   if (BOOT.notes.length) console.warn('Smilebook: avisos al abrir', BOOT.notes); $('#lockBtn').hidden = !VAULT.rec; setTimeout(async () => { await resumeEncryption(); await migrateParts(); }, 1500);
-  if (VAULT.key){ await odLoadTok(); await odHandleRedirect(); setTimeout(odAutoBackup, 5000); }
+  if (VAULT.key){ await odLoadTok(); await odHandleRedirect(); setTimeout(odAutoBackup, 2500); }
   if (VAULT.unreadable) setTimeout(rescueOffer, 600);
   if (!VAULT.rec && odWeb()){
     const u = new URL(location.href), welcomed = (() => { try { return localStorage.getItem('ec-welcome'); } catch { return '1'; } })();
