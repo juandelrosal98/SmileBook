@@ -3880,8 +3880,14 @@ function validLm(rec){
   const src = rec.edited ? 'edited' : 'original', stamp = rec.edited ? rec.updatedAt : 0;
   return rec.landmarks && rec.landmarks.src === src && rec.landmarks.stamp === stamp ? rec.landmarks.pts : null;
 }
-/* two-point picker with a magnifier loupe (precise with finger or pen) */
-function pickTwoPoints(rec, title, opts = {}){
+/* two-point picker with a magnifier loupe (precise with finger or pen); the photo is decrypted before it is shown and measured */
+async function pickTwoPoints(rec, title, opts = {}){
+  const key = opts.useEdited && rec.edited ? 'edited' : 'original';
+  if (rec[key]?.__lazy) rec = {...rec, [key]: await realBlob(rec[key])};
+  if (opts.ref?.blob) opts = {...opts, ref: {...opts.ref, url: URL.createObjectURL(await realBlob(opts.ref.blob))}};
+  return pickTwoPointsShow(rec, title, opts);
+}
+function pickTwoPointsShow(rec, title, opts = {}){
   const blob = opts.useEdited ? (rec.edited || rec.original) : rec.original;
   const url = blobUrl((opts.useEdited ? 'pe:' : 'po:') + rec.id, blob);
   const pts = (opts.initial || []).map(p => ({...p}));
@@ -4006,7 +4012,7 @@ async function seriesAlign(ref, targets){
     ref.landmarks = {src: ref.edited ? 'edited' : 'original', stamp: ref.edited ? ref.updatedAt : 0, pts: lm}; await save('images', ref);
   }
   const refImg = await blobToImage(ref.edited || ref.original), R = {w: refImg.naturalWidth, h: refImg.naturalHeight, lm};
-  const refUrl = blobUrl('pe:' + ref.id, ref.edited || ref.original);
+  const refUrl = URL.createObjectURL(await realBlob(ref.edited || ref.original));
   let done = 0;
   for (let i = 0; i < targets.length; i++){
     const t = targets[i];
