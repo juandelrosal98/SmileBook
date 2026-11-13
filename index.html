@@ -801,6 +801,8 @@ body{font-weight:300;font-feature-settings:'cv11','ss01';letter-spacing:-.005em}
 .brand b,.about .wm b{font-weight:600}
 .btn,.views button,.seg button,.tabs button,.pitem .nm,.sessname,.thumb .meta .ty,label.field>span,.field>span,.chip,.menu button{font-weight:450}
 .btn.primary{font-weight:500}
+.guide{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:8px;font-size:13.5px;line-height:1.45}
+.copyrow{display:flex;gap:8px;align-items:center;margin-top:6px}.copyrow code{flex:1;min-width:0;overflow-wrap:anywhere;background:var(--raise);padding:7px 10px;border-radius:8px;font-size:12.5px}
 </style>
 
 <div class="app">
@@ -2550,6 +2552,29 @@ function odDirty(){
   if (OD.restoring) return;
   try { localStorage.setItem('ec-dirty', String(Date.now())); } catch {}
   clearTimeout(OD.autoT); OD.autoT = setTimeout(odAutoBackup, 3 * 60 * 1000);
+}
+/* one-time setup guide: what to do in Microsoft's portal, with this install's exact address to copy */
+function odGuide(){
+  const uri = odRedirect();
+  openDialog(`<h3>Conectar OneDrive</h3>
+    <p class="hint">Microsoft pide registrar Smilebook una vez con tu cuenta. Es gratis y tarda unos 5 minutos. Después pegas aquí el código que te da y listo.</p>
+    <ol class="guide">
+      <li>Abre <b>portal.azure.com</b> e inicia sesión con tu cuenta de Outlook.</li>
+      <li>Busca <b>«Registros de aplicaciones»</b> › <b>Nuevo registro</b>.</li>
+      <li>Nombre: <b>Smilebook</b>. Tipos de cuenta: la opción que incluye <b>cuentas personales de Microsoft</b>.</li>
+      <li>URI de redirección: elige <b>Aplicación de página única (SPA)</b> y pega esta dirección exacta:
+        <div class="copyrow"><code id="gUri">${esc(uri)}</code><button class="btn sm" type="button" id="gCopy">Copiar</button></div></li>
+      <li>Pulsa <b>Registrar</b> y copia el <b>Id. de aplicación (cliente)</b>.</li>
+      <li>En <b>Permisos de API › Agregar un permiso › Microsoft Graph › Permisos delegados</b>, marca <b>Files.ReadWrite.AppFolder</b> y <b>offline_access</b>.</li>
+    </ol>
+    <label class="field"><span>Pega aquí el Id. de aplicación (cliente)</span><input type="text" id="gId" placeholder="00000000-0000-0000-0000-000000000000" spellcheck="false" autocomplete="off" style="font-family:var(--font-mono)"></label>
+    <p class="lockerr" id="gErr"></p>
+    <div class="foot"><button class="btn" type="button" id="gNo">Más tarde</button><button class="btn primary" type="button" id="gGo">Guardar y conectar</button></div>`);
+  $('#gCopy').onclick = async () => { try { await navigator.clipboard.writeText(uri); toast('Dirección copiada.'); } catch { toast('Selecciónala y cópiala a mano.'); } };
+  $('#gNo').onclick = () => closeDialog(null);
+  $('#gGo').onclick = () => { const id = $('#gId').value.trim();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)){ $('#gErr').textContent = 'No parece un Id. válido: son 36 caracteres con guiones, como 1a2b3c4d-…'; return; }
+    PREFS.odClientId = id; savePrefs(); closeDialog(true); odConnect(); };
 }
 async function odAutoBackup(){
   if (PREFS.odAuto === false || !VAULT.key || !odReady() || OD.busy || !(await odLoadTok())) return;
@@ -5555,7 +5580,7 @@ function openPrefs(tab = 'look'){
         ${VAULT.rec ? `<div class="prow"><span>Bloqueo automático<small>Tras este tiempo sin tocar la app.</small></span><select id="pfLockMin">${[5, 15, 30, 60].map(m => `<option value="${m}"${(PREFS.lockMin || 15) === m ? ' selected' : ''}>${m} min</option>`).join('')}</select></div>` : ''}
         <div class="prow"><span>Copia de seguridad<small>${L.lastBackup ? 'Última: ' + new Date(L.lastBackup).toLocaleDateString('es-ES') : 'Aún no has hecho ninguna.'}</small></span><span class="btns"><button class="btn sm" type="button" id="pfBackup">Descargar copia en este equipo</button><button class="btn sm" type="button" id="pfRestore">Restaurar…</button></span></div>
         <div class="prow"><span>Copia en OneDrive<small>${!VAULT.rec ? 'Activa antes el cifrado: a la nube solo suben copias cifradas.' : window.claude || !/^https?:/.test(location.protocol) ? 'Disponible en la app instalada desde tu web; aquí, dentro de claude.ai, no se puede conectar con Microsoft.' : OD.tok ? `Conectado${OD.tok.user ? ' · ' + esc(OD.tok.user) : ''}. Copias cifradas e incrementales en Aplicaciones › Smilebook: cada foto se sube una sola vez y luego solo lo nuevo. Se guardan las ${OD.keep} últimas versiones.` : 'Sin conectar.'}</small><span id="odProg" class="hint"></span></span>
-          <span class="btns">${VAULT.rec && odReady() ? (OD.tok ? '<button class="btn sm primary" type="button" id="pfOdUp">Copiar ahora</button><button class="btn sm" type="button" id="pfOdRe">Restaurar…</button><button class="btn sm ghost danger" type="button" id="pfOdOff">Desconectar</button>' : '<button class="btn sm primary" type="button" id="pfOdOn">Conectar OneDrive</button>') : ''}</span></div>
+          <span class="btns">${VAULT.rec && !odReady() && !window.claude && /^https?:/.test(location.protocol) ? '<button class="btn sm primary" type="button" id="pfOdGuide">Conectar OneDrive</button>' : ''}${VAULT.rec && odReady() ? (OD.tok ? '<button class="btn sm primary" type="button" id="pfOdUp">Copiar ahora</button><button class="btn sm" type="button" id="pfOdRe">Restaurar…</button><button class="btn sm ghost danger" type="button" id="pfOdOff">Desconectar</button>' : '<button class="btn sm primary" type="button" id="pfOdOn">Conectar OneDrive</button>') : ''}</span></div>
         ${VAULT.rec ? `<div class="prow"><span>Id. de aplicación de Microsoft<small>El código que te da Microsoft al registrar Smilebook (portal.azure.com › Registros de aplicaciones). No es secreto.</small></span><input type="text" id="pfOdId" value="${esc(PREFS.odClientId || '')}" placeholder="00000000-0000-0000-0000-000000000000" spellcheck="false" style="max-width:300px;font-family:var(--font-mono);font-size:12px"></div>
         <div class="prow"><span>Copia automática en OneDrive<small>Al abrir la app y a los pocos minutos de cada cambio. Solo sube lo nuevo, cifrado.</small></span><input type="checkbox" class="switch" id="pfOdAuto" ${PREFS.odAuto !== false ? 'checked' : ''}></div>` : ''}
         <div class="prow"><span>Papelera<small>Se vacía sola a los 30 días.</small></span><button class="btn sm" type="button" id="pfTrash">Abrir papelera</button></div>
@@ -5596,6 +5621,7 @@ function openPrefs(tab = 'look'){
     $('#pfOdId') && ($('#pfOdId').onchange = e => { PREFS.odClientId = e.target.value.trim(); savePrefs(); openPrefs('data'); });
     $('#pfOdAuto') && ($('#pfOdAuto').onchange = e => { PREFS.odAuto = e.target.checked; savePrefs(); });
     $('#pfOdOn') && ($('#pfOdOn').onclick = () => odConnect());
+    $('#pfOdGuide') && ($('#pfOdGuide').onclick = () => odGuide());
     $('#pfOdUp') && ($('#pfOdUp').onclick = () => odBackupNow(false));
     $('#pfOdRe') && ($('#pfOdRe').onclick = () => { closeDialog(null); odRestorePick(); });
     $('#pfOdOff') && ($('#pfOdOff').onclick = async () => { await odSaveTok(null); openPrefs('data'); toast('OneDrive desconectado. Las copias siguen en tu OneDrive.'); });
