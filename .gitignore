@@ -1,0 +1,10 @@
+# nunca subir datos ni exportaciones
+*.zip
+*.jpg
+*.jpeg
+*.heic
+*.mp4
+*.mov
+*.dcm
+backup*
+copia*
