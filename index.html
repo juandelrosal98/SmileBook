@@ -1101,6 +1101,11 @@ body{font-weight:300;font-feature-settings:'cv11','ss01';letter-spacing:-.005em}
 
       <div class="pane" id="pane-frame">
         <div class="group">
+          <button class="btn primary" type="button" id="bakeBtn" style="width:100%">Aplicar recorte <small style="opacity:.75;margin-left:6px">Enter</small></button>
+          <p class="hint" style="margin:6px 0 0">Convierte el encuadre en una versión nueva y fija de la foto. El original se conserva.</p>
+          <button class="btn sm" type="button" id="unbakeBtn" hidden style="margin-top:8px">Volver al original</button>
+        </div>
+        <div class="group">
           <h2>Varias fotos con el mismo encuadre</h2>
           <button class="btn step" type="button" id="batchApply"><span class="stepn">⇉</span><span>Aplicar este encuadre a otras fotos<small>Misma cámara y posición · instantáneo</small></span></button>
           <button class="btn step" type="button" id="batchSeries"><span class="stepn">2</span><span>Igualar con 2 toques por foto<small>Cuando cambió la distancia o el ángulo</small></span></button>
@@ -1471,7 +1476,7 @@ async function openSealedFile(f, start, key){
     out.push(await aesOpen(key, {iv, ct: await f.slice(o + 16, o + 16 + len).arrayBuffer()})); o += 16 + len; }
   return new Blob(out).arrayBuffer();
 }
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 /* the installed app announces a downloaded update; one tap swaps it in (after pending saves) and reloads */
 addEventListener('ps-update', e => {
   if ($('#updBar')) return;
@@ -2255,10 +2260,11 @@ async function buildBackup(){
   const entries = [], u8 = async b => new Uint8Array(await b.arrayBuffer());
   const imgs = [];
   for (const im of L.images){
-    const r = {...im}; delete r.original; delete r.edited; delete r.thumb; delete r.mask;
+    const r = {...im}; delete r.original; delete r.edited; delete r.thumb; delete r.mask; delete r.base;
     r.files = {original: `originales/${im.id}.${im.kind === 'file' ? fileExt(im.original, im.name) : extOf(im.original)}`};
     entries.push({name: r.files.original, data: await u8(im.original)});
     if (im.edited){ r.files.edited = `editadas/${im.id}.${extOf(im.edited)}`; entries.push({name: r.files.edited, data: await u8(im.edited)}); }
+    if (im.base){ r.files.base = `recortes/${im.id}.${extOf(im.base)}`; entries.push({name: r.files.base, data: await u8(im.base)}); }
     if (im.thumb){ r.files.thumb = `miniaturas/${im.id}.jpg`; entries.push({name: r.files.thumb, data: await u8(im.thumb)}); }
     if (im.mask){ r.files.mask = `mascaras/${im.id}.bin`; entries.push({name: r.files.mask, data: new Uint8Array(await realBlob(im.mask))}); }
     imgs.push(r);
@@ -2294,6 +2300,7 @@ async function restore(file){
       if (!files[f.original]) continue;
       im.original = new Blob([files[f.original]], {type: im.kind === 'file' ? 'application/octet-stream' : typeOf(f.original)});
       im.edited = f.edited && files[f.edited] ? new Blob([files[f.edited]], {type: typeOf(f.edited)}) : null;
+      im.base = f.base && files[f.base] ? new Blob([files[f.base]], {type: typeOf(f.base)}) : null;
       im.thumb = f.thumb && files[f.thumb] ? new Blob([files[f.thumb]], {type: 'image/jpeg'}) : im.kind === 'file' ? await makeFileThumb(im.type, im.name || 'archivo', im.original.size) : im.kind === 'video' ? (await makeVideoThumb(im.original)).blob : (await makeThumb(im.edited || im.original)).blob;
       im.mask = f.mask && files[f.mask] ? new Uint8Array(files[f.mask]) : null;
       await save('images', im);
@@ -2432,8 +2439,8 @@ async function odBackupNow(auto){
     const idx = (await DB.get('meta', 'odIndex').catch(() => null))?.value || {names: {}, manifests: []};
     const jobs = [], images = [];
     for (const im of L.images){
-      const meta = {...im}; for (const k of ['original', 'edited', 'thumb', 'mask']) delete meta[k]; meta.bins = {};
-      for (const k of ['original', 'edited', 'thumb', 'mask']){ const v = im[k]; if (!v) continue;
+      const meta = {...im}; for (const k of ['original', 'edited', 'thumb', 'mask', 'base']) delete meta[k]; meta.bins = {};
+      for (const k of ['original', 'edited', 'thumb', 'mask', 'base']){ const v = im[k]; if (!v) continue;
         const sb = v.__lazy ? asBlobParts(v.sealed) : await sealBin(v), name = `${base}/b/${im.id}.${k}.${binTag(sb)}.bin`;
         meta.bins[k] = {name, size: sb.size};
         if (idx.names[name]) idx.names[name].ref = now; else jobs.push({name, sb}); }
@@ -2617,14 +2624,14 @@ function crumbFor(im){
 async function openArchived(im){
   if (im.kind === 'video' || im.kind === 'file') return imageDetail(im);
   try {
-    const img = await blobToImage(im.original);
+    const img = await blobToImage(im.base || im.original);
     E.current = im; E.quick = false;
     $('#navEd').disabled = false; $('#saveBtn').hidden = false; $('#openBtn').hidden = true;
     $('#crumb').innerHTML = crumbFor(im);
     setView('ed');
     loadSource(img, fileBase(im)); S.cal0 = S.cal = im.cal || null;
     if (im.recipe) applyRecipe(im.recipe, await realBlob(im.mask));
-    S.aligned = false; buildRefOptions(im); updateRxUI();
+    S.aligned = false; buildRefOptions(im); updateRxUI(); bakeUI();
     E.baseline = snapshot(); histReset(); setTab(im.type?.startsWith('rx') ? 'rx' : 'frame');
     let dr = null; try { dr = await DB.get('drafts', im.id); } catch {}
     if (dr && dr.at > (im.updatedAt || 0) && E.current === im){
@@ -3942,7 +3949,7 @@ function pickTwoPointsShow(rec, title, opts = {}){
 }
 /* load a photo into the editing engine without showing the editor */
 async function engineLoad(im){
-  const img = await blobToImage(im.original);
+  const img = await blobToImage(im.base || im.original);
   loadSource(img, fileBase(im)); S.cal0 = S.cal = im.cal || null;
   if (im.recipe) applyRecipe(im.recipe, await realBlob(im.mask), true);
   applyRetouch(); rebuildMask(); pend.mask = false;
@@ -4183,6 +4190,7 @@ document.addEventListener('keydown', e => {
   if (mod) return;
   if (S.lasso && (e.key === 'Enter' || e.key === 'Escape' || e.key === 'Backspace' || e.key === 'Delete')){ e.preventDefault();
     if (e.key === 'Enter') lassoClose(); else if (e.key === 'Escape'){ S.lasso = null; req(); } else lassoBack(); return; }
+  if (e.key === 'Enter' && S.tab === 'frame' && !e.repeat && !e.target.closest('button,a')){ e.preventDefault(); bakeCrop(); return; }
   if ((e.key === ',' || e.key === '.') && S.tab === 'frame'){ e.preventDefault(); setAngle(S.angle + (e.key === '.' ? 1 : -1) * (e.shiftKey ? 1 : .1)); return; }
   if (S.tool === 'heal' && (e.key === '[' || e.key === ']')){ S.healSize = Math.max(6, Math.min(180, S.healSize + (e.key === ']' ? 6 : -6))); $('#healSize').value = S.healSize; $('#healSizeOut').textContent = S.healSize + ' px'; req(); return; }
   if (e.key === 'Escape'){ S.levelLine = null; S.pts = S.pts.length === 2 ? S.pts : []; setTool(S.tab === 'frame' ? 'crop' : S.tab === 'bg' ? 'wand' : 'pan'); updateRefUI(); return; }
@@ -4463,6 +4471,40 @@ async function exportImage(){
   } catch (err){ toast('No se pudo exportar: ' + (err?.message || err)); }
   btn.disabled = false; btn.textContent = 'Exportar foto';
 }
+/* «Aplicar recorte»: bakes rotation + crop (+ retouch, background, redactions) into a new fixed version of the photo.
+   The camera original is never touched; im.base holds the baked version and becomes the starting point. */
+function bakeUI(){ const b = $('#unbakeBtn'); if (b) b.hidden = !E.current?.base; }
+async function bakeCrop(){
+  if (!S.W || E.baking) return;
+  E.baking = true; const btn = $('#bakeBtn'); btn.disabled = true;
+  await new Promise(r => setTimeout(r, 20));
+  try {
+    const adj = {...S.adj};
+    for (const k of Object.keys(ADJ0)) S.adj[k] = 0;
+    const alpha = !S.maskEmpty && S.bg === 'transparent', fmt = alpha ? 'png' : 'jpg';
+    let res; try { res = await renderOutput(0, fmt, .96); } finally { Object.assign(S.adj, adj); }
+    const img = await blobToImage(res.blob), im = E.current, keep = {adj, bg: S.bg};
+    const prev = im ? {base: im.base || null, recipe: im.recipe, mask: im.mask, edited: im.edited, editedFmt: im.editedFmt, thumb: im.thumb} : null;
+    loadSource(img, im ? fileBase(im) : ($('#outName').value.replace(/_editada$/, '') || 'foto'));
+    for (const k of Object.keys(keep.adj)) setAdj(k, keep.adj[k]);
+    if (keep.bg !== 'transparent') setBg(keep.bg, true);
+    S.cal = null; histReset(); req('mask', 'adj');
+    if (im){
+      im.base = res.blob; await renderAndStore(im); E.baseline = snapshot(); DB.del('drafts', im.id).catch(() => {}); bakeUI();
+      toastAction('Recorte aplicado: es la nueva versión de la foto.', 'Deshacer', async () => {
+        Object.assign(im, prev, {updatedAt: Date.now()}); if (!prev.base) delete im.base; await save('images', im); openArchived(im); });
+    } else toast('Recorte aplicado.');
+  } catch (err){ toast('No se pudo aplicar el recorte: ' + (err?.message || err)); }
+  finally { E.baking = false; btn.disabled = false; }
+}
+async function unbakeCrop(){
+  const im = E.current; if (!im?.base) return;
+  if (!await confirmDlg('¿Volver a la foto original?', 'Se quita el recorte aplicado y vuelves a la foto completa de la cámara.', 'Volver al original', false)) return;
+  delete im.base; im.recipe = null; im.mask = null; im.edited = null; im.thumb = (await makeThumb(await realBlob(im.original))).blob;
+  im.updatedAt = Date.now(); await save('images', im); openArchived(im); toast('Has vuelto a la foto original.');
+}
+$('#bakeBtn').onclick = bakeCrop;
+$('#unbakeBtn').onclick = unbakeCrop;
 async function saveToCase(){
   const im = E.current; if (!im || !S.W) return false;
   const btn = $('#saveBtn'); btn.disabled = true; btn.textContent = 'Guardando…';
