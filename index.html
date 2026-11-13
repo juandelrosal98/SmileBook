@@ -803,6 +803,13 @@ body{font-weight:300;font-feature-settings:'cv11','ss01';letter-spacing:-.005em}
 .btn.primary{font-weight:500}
 .guide{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:8px;font-size:13.5px;line-height:1.45}
 .copyrow{display:flex;gap:8px;align-items:center;margin-top:6px}.copyrow code{flex:1;min-width:0;overflow-wrap:anywhere;background:var(--raise);padding:7px 10px;border-radius:8px;font-size:12.5px}
+.odcard{margin:0 0 10px;padding:10px;border-radius:12px;background:rgba(255,255,255,.1);color:#fff}
+.odcard .odsign{display:flex;align-items:center;gap:10px;width:100%;padding:10px 12px;border:0;border-radius:10px;background:#fff;color:#2f3d5c;font:inherit;font-weight:500;text-align:left;cursor:pointer}
+.odcard .odsign small{display:block;font-weight:300;font-size:11.5px;opacity:.75;margin-top:1px}
+.odcard .odsign:hover{background:#f4f1ea}
+.odhead{display:flex;align-items:center;gap:10px}.odhead small{display:block;font-size:11.5px;opacity:.8;overflow-wrap:anywhere}
+.odbtns{display:flex;gap:6px;margin-top:8px}.odbtns button{flex:1;padding:7px 8px;border:0;border-radius:8px;background:rgba(255,255,255,.18);color:#fff;font:inherit;font-size:12.5px;cursor:pointer}
+.odbtns button:hover{background:rgba(255,255,255,.28)}
 </style>
 
 <div class="app">
@@ -1496,7 +1503,7 @@ async function openSealedFile(f, start, key){
     out.push(await aesOpen(key, {iv, ct: await f.slice(o + 16, o + 16 + len).arrayBuffer()})); o += 16 + len; }
   return new Blob(out).arrayBuffer();
 }
-const APP_VERSION = '1.4.1';
+const APP_VERSION = '1.5.0';
 /* the installed app announces a downloaded update; one tap swaps it in (after pending saves) and reloads */
 addEventListener('ps-update', e => {
   if ($('#updBar')) return;
@@ -1953,8 +1960,25 @@ async function renderStore(){
   else if (nImg && !VAULT.rec) warn = `<span class="warn">Archivo sin cifrar. <button type="button" class="linkbtn" id="encLink">Cifrar ahora</button></span>`;
   else if (nImg && !L.lastBackup) warn = `<span class="warn">Aún no has hecho ninguna copia de seguridad.</span>`;
   else if (L.lastBackup && Date.now() - L.lastBackup > 7*864e5 && nImg) warn = `<span class="warn">Tu última copia tiene más de una semana.</span>`;
-  $('#storeInfo').innerHTML = `<div class="storerow"><span>En este navegador</span><b>${fmtMB(used)}</b></div><div class="gauge" title="${pct.toFixed(1).replace('.', ',')} % del espacio disponible"><i style="width:${Math.max(.5, pct)}%"></i></div>${warn ? `<div class="storerow">${warn}</div>` : ''}`;
+  const ago = t => { const m = Math.round((Date.now() - t) / 60000); return m < 1 ? 'ahora mismo' : m < 60 ? `hace ${m} min` : m < 1440 ? `hace ${Math.round(m / 60)} h` : `hace ${Math.round(m / 1440)} días`; };
+  const od = !odWeb() ? '' : OD.tok
+    ? `<div class="odcard on"><div class="odhead">${OD_ICON}<span><b>OneDrive conectado</b><small>${esc(OD.tok.user || '')}${L.lastCloud ? ` · copia ${ago(L.lastCloud)}` : ''}</small></span></div>
+       <div class="odbtns"><button type="button" id="odSideUp">${OD.busy ? 'Guardando…' : 'Guardar ahora'}</button><button type="button" id="odSideRe">Cargar copia</button></div></div>`
+    : `<div class="odcard"><button type="button" class="odsign" id="odSideIn">${OD_ICON}<span>Iniciar sesión en OneDrive<small>Tus pacientes se guardan solos en tu nube</small></span></button></div>`;
+  if (warn && OD.tok && /copia/.test(warn)) warn = '';
+  $('#storeInfo').innerHTML = od + `<div class="storerow"><span>En este navegador</span><b>${fmtMB(used)}</b></div><div class="gauge" title="${pct.toFixed(1).replace('.', ',')} % del espacio disponible"><i style="width:${Math.max(.5, pct)}%"></i></div>${warn ? `<div class="storerow">${warn}</div>` : ''}`;
   $('#encLink')?.addEventListener('click', () => enableVault());
+  $('#odSideIn')?.addEventListener('click', odSignIn);
+  $('#odSideUp')?.addEventListener('click', () => { if (!OD.busy) odBackupNow(false); });
+  $('#odSideRe')?.addEventListener('click', () => odRestorePick());
+}
+const OD_ICON = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 18.5h10.5a4 4 0 0 0 .6-7.95A5.5 5.5 0 0 0 7.6 9.2 4.66 4.66 0 0 0 7 18.5z"/></svg>';
+/* one button for everything: with a password already, connect and copy (or load, on an empty device);
+   on a device with no password yet, sign in first: if the cloud holds data, it loads with the account's password */
+function odSignIn(){
+  if (!odReady()) return toast('OneDrive funciona en la app instalada desde tu web, no dentro de claude.ai.');
+  if (VAULT.key) return odConnect();
+  return odConnect(true);
 }
 function renderLib(){ renderPatients(); renderMain(); renderStore(); updateSel(); }
 /* ---------- Finder-style selection, cut / copy / paste between sessions ---------- */
@@ -2523,7 +2547,9 @@ async function odFreshReturn(){
       for (const c of cs) await remove('cases', c.id);
       await remove('patients', sp.id);
     }
+    const hadOwn = L.patients.some(p => !p.sample && alive(p));
     await restoreV2(m, VAULT.key, m.patients.filter(p => !p.trashed).map(p => p.id), true);
+    if (hadOwn) setTimeout(() => odBackupNow(true), 2500);
     const first = [...L.patients.filter(p => alive(p) && !p.sample)].sort((a, b) => a.name.localeCompare(b.name, 'es'))[0];
     if (first){ L.sel = first.id; renderLib(); }
     const at = Date.parse(m.exportedAt) || Date.now(); L.lastCloud = L.lastBackup = at;
