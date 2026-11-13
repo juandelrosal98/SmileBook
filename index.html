@@ -1496,7 +1496,7 @@ async function openSealedFile(f, start, key){
     out.push(await aesOpen(key, {iv, ct: await f.slice(o + 16, o + 16 + len).arrayBuffer()})); o += 16 + len; }
   return new Blob(out).arrayBuffer();
 }
-const APP_VERSION = '1.3.2';
+const APP_VERSION = '1.4.0';
 /* the installed app announces a downloaded update; one tap swaps it in (after pending saves) and reloads */
 addEventListener('ps-update', e => {
   if ($('#updBar')) return;
@@ -1645,11 +1645,11 @@ function lockScreen(mode = 'pw'){
     const el = lockHost();
     const draw = () => {
       el.innerHTML = `<form class="lockcard" autocomplete="off"><div class="lockmark">${logoSvg(56, 1.6)}</div>
-        <h2>${mode === 'pw' ? 'Smilebook está bloqueado' : 'Clave de recuperación'}</h2>
-        <p class="hint">${mode === 'pw' ? 'Tus pacientes están cifrados en este dispositivo. Escribe tu contraseña para abrirlos.' : 'Escribe la clave de recuperación que guardaste al activar el cifrado.'}</p>
+        <h2>${mode === 'pw' ? 'Iniciar sesión' : 'Clave de recuperación'}</h2>
+        <p class="hint">${mode === 'pw' ? 'Escribe tu contraseña de Smilebook para abrir tus pacientes.' : 'Escribe la clave de recuperación que guardaste al activar el cifrado.'}</p>
         <input type="${mode === 'pw' ? 'password' : 'text'}" id="lockIn" aria-label="${mode === 'pw' ? 'Contraseña' : 'Clave de recuperación'}" ${mode === 'pw' ? 'autocomplete="current-password"' : 'autocapitalize="characters" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"'}>
         <p class="lockerr" id="lockErr" role="alert"></p>
-        <button class="btn primary" type="submit" id="lockGo">Desbloquear</button>
+        <button class="btn primary" type="submit" id="lockGo">Entrar</button>
         <button class="btn ghost sm" type="button" id="lockAlt">${mode === 'pw' ? 'He olvidado la contraseña' : 'Usar la contraseña'}</button></form>`;
       $('#lockIn').focus();
       $('#lockAlt').onclick = () => { mode = mode === 'pw' ? 'rec' : 'pw'; draw(); };
@@ -1658,7 +1658,7 @@ function lockScreen(mode = 'pw'){
         $('#lockGo').disabled = true; $('#lockGo').textContent = 'Comprobando…'; $('#lockErr').textContent = '';
         let raw;
         try { raw = await unwrapWith(VAULT.rec, val, mode); }
-        catch { $('#lockGo').disabled = false; $('#lockGo').textContent = 'Desbloquear'; $('#lockErr').textContent = mode === 'pw' ? 'Contraseña incorrecta.' : 'Clave de recuperación incorrecta.';
+        catch { $('#lockGo').disabled = false; $('#lockGo').textContent = 'Entrar'; $('#lockErr').textContent = mode === 'pw' ? 'Contraseña incorrecta.' : 'Clave de recuperación incorrecta.';
           const f = el.querySelector('form'); f.classList.remove('shake'); void f.offsetWidth; f.classList.add('shake'); $('#lockIn').select(); return; }
         VAULT.key = await importDataKey(raw); await resumeSave(raw); await keyringLoad();
         if (mode === 'rec'){ const pw = await askNewPassword(el); Object.assign(VAULT.rec, await wrapPassword(raw, pw)); await DB.put('meta', VAULT.rec); }
@@ -1724,7 +1724,9 @@ async function runEncrypt(pw, code){
     const rows = {}; let total = 0, done = 0;
     for (const s of ENC_STORES){ rows[s] = (await DB.raw(s)).filter(r => !r.__enc); total += rows[s].length; }
     for (const s of ENC_STORES) for (const r of rows[s]){ await DB.put(s, r); done++; if (done % 5 === 0 || done === total){ const pg = $('#encProg'); if (pg) pg.textContent = `${done} de ${total} registros cifrados`; } }
-    closeDialog(true); $('#lockBtn').hidden = false; renderStore(); try { new BroadcastChannel('smilebook').postMessage('vault'); } catch {}
+    closeDialog(true); $('#lockBtn').hidden = false; renderStore();
+    if (OD.pendingTok){ await odSaveTok(OD.pendingTok); OD.pendingTok = null; setTimeout(() => odBackupNow(true), 1500); }
+    try { new BroadcastChannel('smilebook').postMessage('vault'); } catch {}
     toast(`Archivo cifrado: ${total} registros. A partir de ahora se pedirá la contraseña al abrir.`);
   } catch (err){ closeDialog(null); toast('No se pudo cifrar: ' + (err?.message || err)); }
 }
@@ -2391,35 +2393,42 @@ async function restore(file){
    Tokens live in the encrypted 'secrets' store, so OneDrive requires the vault.
    ====================================================================== */
 const OD = {busy: false, cancel: false, auth: 'https://login.microsoftonline.com/consumers/oauth2/v2.0', graph: 'https://graph.microsoft.com/v1.0', scope: 'Files.ReadWrite.AppFolder offline_access User.Read', keep: 10, tok: null};
+const OD_CLIENT_DEFAULT = '';   // the app id registered in Azure; public by design (PKCE, no secret)
+const odClient = () => PREFS.odClientId || OD_CLIENT_DEFAULT;
 const odRedirect = () => location.origin + location.pathname;
-const odReady = () => !!(PREFS.odClientId && /^https?:/.test(location.protocol) && !window.claude);
+const odWeb = () => /^https?:/.test(location.protocol) && !window.claude;
+const odReady = () => !!(odClient() && odWeb());
 const b64url = u => b64(u).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 async function odLoadTok(){ try { const r = await DB.get('secrets', 'onedrive'); OD.tok = r?.tok || null; } catch { OD.tok = null; } return OD.tok; }
 async function odSaveTok(t){ OD.tok = t; if (t) await DB.put('secrets', {id: 'onedrive', tok: t}); else await DB.del('secrets', 'onedrive').catch(() => {}); }
-async function odConnect(){
-  if (!VAULT.key) return toast('Activa primero el cifrado (Preferencias › Datos): las copias y el acceso a OneDrive se guardan cifrados.');
+async function odConnect(fresh = false){
+  if (!fresh && !VAULT.key) return toast('Activa primero el cifrado (Preferencias › Datos): las copias y el acceso a OneDrive se guardan cifrados.');
   if (!odReady()) return toast('Pega antes el Id. de aplicación de Microsoft, y usa la app instalada desde tu web.');
   const verifier = b64url(crypto.getRandomValues(new Uint8Array(48))), state = b64url(crypto.getRandomValues(new Uint8Array(16)));
   const challenge = b64url(new Uint8Array(await crypto.subtle.digest('SHA-256', te.encode(verifier))));
-  try { localStorage.setItem('od-pkce', JSON.stringify({verifier, state, at: Date.now()})); } catch {}
-  sessionStorage.setItem('od-pkce', JSON.stringify({verifier, state}));
-  const q = new URLSearchParams({client_id: PREFS.odClientId, response_type: 'code', redirect_uri: odRedirect(), scope: OD.scope, code_challenge: challenge, code_challenge_method: 'S256', state, prompt: 'select_account'});
+  try { localStorage.setItem('od-pkce', JSON.stringify({verifier, state, fresh, at: Date.now()})); } catch {}
+  sessionStorage.setItem('od-pkce', JSON.stringify({verifier, state, fresh}));
+  const q = new URLSearchParams({client_id: odClient(), response_type: 'code', redirect_uri: odRedirect(), scope: OD.scope, code_challenge: challenge, code_challenge_method: 'S256', state, prompt: 'select_account'});
   location.assign(`${OD.auth}/authorize?${q}`);
 }
 async function odTokenRequest(body){
-  const r = await fetch(`${OD.auth}/token`, {method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body: new URLSearchParams({client_id: PREFS.odClientId, scope: OD.scope, ...body})});
+  const r = await fetch(`${OD.auth}/token`, {method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body: new URLSearchParams({client_id: odClient(), scope: OD.scope, ...body})});
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw Object.assign(new Error(j.error_description || j.error || 'Microsoft rechazó la conexión'), {code: j.error});
   return {access: j.access_token, refresh: j.refresh_token || OD.tok?.refresh || null, exp: Date.now() + (j.expires_in - 120) * 1000, user: OD.tok?.user || null};
+}
+function odTakePkce(state){
+  let saved = null; try { saved = JSON.parse(sessionStorage.getItem('od-pkce') || 'null'); } catch {}
+  if (!saved || saved.state !== state){ try { const l = JSON.parse(localStorage.getItem('od-pkce') || 'null'); if (l && Date.now() - l.at < 15 * 60000) saved = l; } catch {} }
+  sessionStorage.removeItem('od-pkce'); try { localStorage.removeItem('od-pkce'); } catch {}
+  return saved;
 }
 /* back from Microsoft with ?code= : exchanged after the vault is open, then the address is cleaned */
 async function odHandleRedirect(){
   const u = new URL(location.href), code = u.searchParams.get('code'), err = u.searchParams.get('error');
   if (!code && !err) return;
   history.replaceState(null, '', odRedirect());
-  let saved = null; try { saved = JSON.parse(sessionStorage.getItem('od-pkce') || 'null'); } catch {}
-  if (!saved || saved.state !== u.searchParams.get('state')){ try { const l = JSON.parse(localStorage.getItem('od-pkce') || 'null'); if (l && Date.now() - l.at < 15 * 60000) saved = l; } catch {} }
-  sessionStorage.removeItem('od-pkce'); try { localStorage.removeItem('od-pkce'); } catch {}
+  const saved = odTakePkce(u.searchParams.get('state'));
   if (err) return toast('No se conectó OneDrive: ' + (u.searchParams.get('error_description') || err));
   if (!saved || saved.state !== u.searchParams.get('state')) return toast('La respuesta de Microsoft no coincide con esta sesión. Vuelve a conectar OneDrive.');
   try {
@@ -2431,6 +2440,96 @@ async function odHandleRedirect(){
     if (L.patients.some(p => !p.sample && alive(p))){ toast(`OneDrive conectado${t.user ? ': ' + t.user : ''}. Haciendo la primera copia…`); setTimeout(() => odBackupNow(true), 1500); }
     else { toast(`OneDrive conectado${t.user ? ': ' + t.user : ''}.`); setTimeout(() => odRestorePick(), 800); }
   } catch (e){ toast('No se pudo conectar OneDrive: ' + e.message); }
+}
+/* the cloud copies, newest first */
+async function odManifestRows(){
+  const rows = [];
+  for (const d of (await odChildren('v2')).filter(x => x.folder)) for (const f of await odChildren(`v2/${d.name}/m`)) if (/\.psb$/i.test(f.name)) rows.push({kind: 2, path: `v2/${d.name}/m/${f.name}`, at: f.lastModifiedDateTime, size: f.size, dev: d.name});
+  return rows.sort((a, b) => b.at.localeCompare(a.at));
+}
+const lockMsg = (el, h, p = '') => { el.innerHTML = `<div class="lockcard"><div class="lockmark">${logoSvg(56, 1.6)}</div><h2>${h}</h2><p class="hint" id="lockProg">${p}</p></div>`; };
+function welcomeScreen(){
+  const el = lockHost();
+  el.innerHTML = `<div class="lockcard"><div class="lockmark">${logoSvg(56, 1.6)}</div><h2>Bienvenido a Smilebook</h2>
+    <p class="hint">Inicia sesión con tu cuenta de Microsoft y se cargarán todos tus pacientes desde tu OneDrive. Todo va cifrado con tu contraseña de Smilebook.</p>
+    ${odClient() ? '' : `<input type="text" id="wcId" placeholder="Id. de aplicación de Microsoft" spellcheck="false" autocomplete="off" style="font-family:var(--font-mono)">`}
+    <p class="lockerr" id="wcErr"></p>
+    <button class="btn primary" type="button" id="wcMs">Iniciar sesión con Microsoft</button>
+    <button class="btn ghost sm" type="button" id="wcNew">Empezar sin cuenta</button></div>`;
+  $('#wcMs').onclick = () => {
+    const f = $('#wcId'); if (f){ const id = f.value.trim();
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)){ $('#wcErr').textContent = 'Pega el Id. de aplicación (36 caracteres con guiones).'; return; }
+      PREFS.odClientId = id; savePrefs(); }
+    odConnect(true); };
+  $('#wcNew').onclick = () => { try { localStorage.setItem('ec-welcome', '1'); } catch {} el.remove(); };
+}
+/* the Smilebook password of the account (the one used on the other devices) opens the cloud copy */
+function freshPassword(el, rec){
+  return new Promise(res => {
+    let mode = 'pw';
+    const draw = () => {
+      el.innerHTML = `<form class="lockcard" autocomplete="off"><div class="lockmark">${logoSvg(56, 1.6)}</div><h2>${mode === 'pw' ? 'Tu contraseña de Smilebook' : 'Clave de recuperación'}</h2>
+        <p class="hint">${mode === 'pw' ? 'La misma que usas en tus otros dispositivos. Con ella se descifran tus pacientes.' : 'La clave de recuperación que guardaste al activar el cifrado.'}</p>
+        <input type="${mode === 'pw' ? 'password' : 'text'}" id="lockIn" aria-label="Contraseña" ${mode === 'pw' ? 'autocomplete="current-password"' : 'spellcheck="false"'}>
+        <p class="lockerr" id="lockErr" role="alert"></p>
+        <button class="btn primary" type="submit" id="lockGo">Entrar</button>
+        <button class="btn ghost sm" type="button" id="lockAlt">${mode === 'pw' ? 'He olvidado la contraseña' : 'Usar la contraseña'}</button></form>`;
+      $('#lockIn').focus();
+      $('#lockAlt').onclick = () => { mode = mode === 'pw' ? 'rec' : 'pw'; draw(); };
+      el.querySelector('form').onsubmit = async e => { e.preventDefault(); const v = $('#lockIn').value.trim(); if (!v) return;
+        $('#lockGo').disabled = true; $('#lockGo').textContent = 'Comprobando…';
+        try { const raw = await unwrapWith(rec, v, mode); if (mode === 'rec'){ const pw = await askNewPassword(el); Object.assign(rec, await wrapPassword(raw, pw)); } res(raw); }
+        catch { $('#lockGo').disabled = false; $('#lockGo').textContent = 'Entrar'; $('#lockErr').textContent = mode === 'pw' ? 'Contraseña incorrecta.' : 'Clave incorrecta.'; } };
+    };
+    draw();
+  });
+}
+/* this device takes the account's vault: same key, same password everywhere */
+async function adoptVault(h, raw){
+  const rec = {id: 'vault', v: 1, iter: h.iter, saltPw: h.saltPw, wrapPw: h.wrapPw, saltRec: h.saltRec, wrapRec: h.wrapRec, created: Date.now()};
+  VAULT.key = await importDataKey(raw);
+  await DB.put('meta', {...rec, id: 'vault-' + rec.created}); await DB.put('meta', rec); VAULT.rec = rec;
+  await resumeSave(raw);
+  for (const st of ENC_STORES) for (const r of (await DB.raw(st)).filter(r => !r.__enc)) await DB.put(st, r);   // the example case, sealed too
+  if (OD.tok) await odSaveTok(OD.tok);
+  $('#lockBtn').hidden = false; try { new BroadcastChannel('smilebook').postMessage('vault'); } catch {}
+}
+async function odFreshReturn(){
+  const u = new URL(location.href), code = u.searchParams.get('code'), err = u.searchParams.get('error');
+  history.replaceState(null, '', odRedirect());
+  const saved = odTakePkce(u.searchParams.get('state'));
+  if (err) return toast('No se inició sesión: ' + (u.searchParams.get('error_description') || err));
+  if (!saved) return toast('La respuesta de Microsoft no coincide con esta sesión. Vuelve a iniciar sesión.');
+  const el = lockHost();
+  try {
+    lockMsg(el, 'Conectando con OneDrive…');
+    OD.tok = await odTokenRequest({grant_type: 'authorization_code', code, redirect_uri: odRedirect(), code_verifier: saved.verifier});
+    try { const me = await odFetch('/me?$select=displayName,userPrincipalName'); OD.tok.user = me.userPrincipalName || me.displayName; } catch {}
+    lockMsg(el, 'Buscando tus pacientes…');
+    const rows = await odManifestRows();
+    if (!rows.length){ el.remove(); OD.pendingTok = OD.tok; toast('Tu OneDrive aún no tiene datos de Smilebook. Crea tu contraseña y empezará a guardarse ahí.'); enableVault(); return; }
+    const file = new File([await odGetFile(rows.at(0).path)], 'm.psb'), {start, rec} = await readSealedHeader(file);
+    const raw = await freshPassword(el, rec);
+    lockMsg(el, 'Cargando tus pacientes…', 'Descifrando');
+    await adoptVault(rec, raw); raw.fill(0);
+    const m = JSON.parse(td.decode(await openSealedFile(file, start, VAULT.key)));
+    if (m.prefs?.odClientId && !PREFS.odClientId){ PREFS.odClientId = m.prefs.odClientId; savePrefs(); }
+    el.remove(); try { localStorage.setItem('ec-welcome', '1'); } catch {}
+    // this device's own example case gives way to the account's data (which carries its own example if kept)
+    for (const sp of L.patients.filter(x => x.sample)){
+      const cs = L.cases.filter(c => c.patientId === sp.id), cids = new Set(cs.map(c => c.id));
+      for (const im of L.images.filter(i => cids.has(i.caseId))) await remove('images', im.id);
+      for (const x of L.sessions.filter(x => cids.has(x.caseId))) await remove('sessions', x.id);
+      for (const c of cs) await remove('cases', c.id);
+      await remove('patients', sp.id);
+    }
+    await restoreV2(m, VAULT.key, m.patients.filter(p => !p.trashed).map(p => p.id), true);
+    const first = [...L.patients.filter(p => alive(p) && !p.sample)].sort((a, b) => a.name.localeCompare(b.name, 'es'))[0];
+    if (first){ L.sel = first.id; renderLib(); }
+    const at = Date.parse(m.exportedAt) || Date.now(); L.lastCloud = L.lastBackup = at;
+    await DB.put('meta', {id: 'lastCloud', value: at}).catch(() => {}); await DB.put('meta', {id: 'lastBackup', value: at}).catch(() => {});
+    renderStore();
+  } catch (e){ el.remove(); toast('No se pudo iniciar sesión: ' + e.message); }
 }
 async function odAccess(){
   if (!OD.tok) await odLoadTok();
@@ -2566,8 +2665,7 @@ async function odBackupNow(auto){
 async function odRestorePick(){
   try {
     toast('Buscando tus copias en OneDrive…');
-    const rows = [];
-    for (const d of (await odChildren('v2')).filter(x => x.folder)) for (const f of await odChildren(`v2/${d.name}/m`)) if (/\.psb$/i.test(f.name)) rows.push({kind: 2, path: `v2/${d.name}/m/${f.name}`, at: f.lastModifiedDateTime, size: f.size, dev: d.name});
+    const rows = await odManifestRows();
     for (const f of await odChildren('copias')) if (/\.psb$/i.test(f.name)) rows.push({kind: 1, path: `copias/${f.name}`, at: f.lastModifiedDateTime, size: f.size});
     if (!rows.length) return toast('Todavía no hay copias en tu OneDrive.');
     rows.sort((a, b) => b.at.localeCompare(a.at));
@@ -6393,6 +6491,11 @@ async function boot(){
   VAULT.onProgress = null; lockEl?.remove(); $('#lockBtn').hidden = !VAULT.rec; setTimeout(async () => { await resumeEncryption(); await migrateParts(); }, 1500);
   if (VAULT.key){ await odLoadTok(); await odHandleRedirect(); setTimeout(odAutoBackup, 5000); }
   if (VAULT.unreadable) setTimeout(rescueOffer, 600);
+  if (!VAULT.rec && odWeb()){
+    const u = new URL(location.href), welcomed = (() => { try { return localStorage.getItem('ec-welcome'); } catch { return '1'; } })();
+    if (u.searchParams.get('code') || u.searchParams.get('error')) odFreshReturn();
+    else if (!welcomed && !L.patients.some(p => !p.sample && alive(p))) welcomeScreen();
+  }
 }
 /* Records sealed with a key this archive no longer has (encryption was switched on twice, e.g. once in the
    browser and once in the installed app). They are never deleted: the earlier key can be recovered from an
