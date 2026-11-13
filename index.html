@@ -1496,7 +1496,7 @@ async function openSealedFile(f, start, key){
     out.push(await aesOpen(key, {iv, ct: await f.slice(o + 16, o + 16 + len).arrayBuffer()})); o += 16 + len; }
   return new Blob(out).arrayBuffer();
 }
-const APP_VERSION = '1.3.1';
+const APP_VERSION = '1.3.2';
 /* the installed app announces a downloaded update; one tap swaps it in (after pending saves) and reloads */
 addEventListener('ps-update', e => {
   if ($('#updBar')) return;
@@ -2401,6 +2401,7 @@ async function odConnect(){
   if (!odReady()) return toast('Pega antes el Id. de aplicación de Microsoft, y usa la app instalada desde tu web.');
   const verifier = b64url(crypto.getRandomValues(new Uint8Array(48))), state = b64url(crypto.getRandomValues(new Uint8Array(16)));
   const challenge = b64url(new Uint8Array(await crypto.subtle.digest('SHA-256', te.encode(verifier))));
+  try { localStorage.setItem('od-pkce', JSON.stringify({verifier, state, at: Date.now()})); } catch {}
   sessionStorage.setItem('od-pkce', JSON.stringify({verifier, state}));
   const q = new URLSearchParams({client_id: PREFS.odClientId, response_type: 'code', redirect_uri: odRedirect(), scope: OD.scope, code_challenge: challenge, code_challenge_method: 'S256', state, prompt: 'select_account'});
   location.assign(`${OD.auth}/authorize?${q}`);
@@ -2416,14 +2417,19 @@ async function odHandleRedirect(){
   const u = new URL(location.href), code = u.searchParams.get('code'), err = u.searchParams.get('error');
   if (!code && !err) return;
   history.replaceState(null, '', odRedirect());
-  const saved = JSON.parse(sessionStorage.getItem('od-pkce') || 'null'); sessionStorage.removeItem('od-pkce');
+  let saved = null; try { saved = JSON.parse(sessionStorage.getItem('od-pkce') || 'null'); } catch {}
+  if (!saved || saved.state !== u.searchParams.get('state')){ try { const l = JSON.parse(localStorage.getItem('od-pkce') || 'null'); if (l && Date.now() - l.at < 15 * 60000) saved = l; } catch {} }
+  sessionStorage.removeItem('od-pkce'); try { localStorage.removeItem('od-pkce'); } catch {}
   if (err) return toast('No se conectó OneDrive: ' + (u.searchParams.get('error_description') || err));
   if (!saved || saved.state !== u.searchParams.get('state')) return toast('La respuesta de Microsoft no coincide con esta sesión. Vuelve a conectar OneDrive.');
   try {
     const t = await odTokenRequest({grant_type: 'authorization_code', code, redirect_uri: odRedirect(), code_verifier: saved.verifier});
     await odSaveTok(t);
     try { const me = await odFetch('/me?$select=displayName,userPrincipalName'); t.user = me.userPrincipalName || me.displayName; await odSaveTok(t); } catch {}
-    toast(`OneDrive conectado${t.user ? ': ' + t.user : ''}.`); renderStore();
+    renderStore();
+    // a device with real patients uploads them; an empty one (new phone) offers to load what is already in the cloud
+    if (L.patients.some(p => !p.sample && alive(p))){ toast(`OneDrive conectado${t.user ? ': ' + t.user : ''}. Haciendo la primera copia…`); setTimeout(() => odBackupNow(true), 1500); }
+    else { toast(`OneDrive conectado${t.user ? ': ' + t.user : ''}.`); setTimeout(() => odRestorePick(), 800); }
   } catch (e){ toast('No se pudo conectar OneDrive: ' + e.message); }
 }
 async function odAccess(){

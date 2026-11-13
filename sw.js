@@ -1,5 +1,5 @@
 // Smilebook offline cache: app shell from cache, refreshed in the background so updates arrive on the next launch
-const CACHE = 'smilebook-1.3.1-1794594089146', SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png'];
+const CACHE = 'smilebook-1.3.2-1794599278191', SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png'];
 // a new version installs alongside the old one and waits; the page shows "Actualizar" and asks it to take over
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL.map(u => new Request(u, {cache: 'reload'}))))); });
 self.addEventListener('message', e => { if (e.data?.type === 'skip-waiting') self.skipWaiting(); });
