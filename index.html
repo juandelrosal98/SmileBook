@@ -11,7 +11,7 @@
 </head>
 <body>
 <title>Smilebook</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@200..700&family=Nunito+Sans:wght@200..800&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@200..700&family=Nunito+Sans:wght@200..800&display=swap" media="print" onload="this.media='all'">
 <style>
 /* Layout: macOS-style app window — translucent source-list sidebar + inset-grouped case sheets; the editor is a dark Photos-like bench with a neutral 18% grey stage and an inspector. Stacks on phones. */
 :root{
@@ -1356,6 +1356,35 @@ body{font-weight:300;font-feature-settings:'cv11','ss01';letter-spacing:-.005em}
 <script>
 (() => {
 'use strict';
+const BOOT = {step: 'cargando la app', at: Date.now(), done: false, wait: false, notes: []};
+const bootStep = (name, wait = false) => { BOOT.step = name; BOOT.at = Date.now(); BOOT.wait = wait; };
+function showFatal(title, detail){
+  try {
+    let el = document.getElementById('fatal');
+    if (!el){ el = document.createElement('div'); el.id = 'fatal';
+      el.style.cssText = 'position:fixed;left:50%;top:72px;transform:translateX(-50%);z-index:99999;width:min(560px,calc(100% - 32px));background:#fffdf9;color:#1d1d1f;border:1px solid #e3cfc4;border-radius:16px;box-shadow:0 16px 48px rgba(0,0,0,.18);padding:18px 20px;font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif';
+      document.body.append(el); }
+    const esc2 = t => String(t).replace(/[&<>]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'})[c]);
+    el.innerHTML = `<b style="font-size:16px">${esc2(title)}</b>
+      <p style="margin:6px 0 10px;color:#555">Haz una captura de este recuadro y mándala. Tus pacientes no se han tocado.</p>
+      <pre style="white-space:pre-wrap;word-break:break-word;background:#f4efe8;padding:10px;border-radius:10px;font-size:12px;max-height:220px;overflow:auto;margin:0 0 12px">${esc2(detail)}</pre>
+      <div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" id="fxRetry" style="padding:8px 14px;border-radius:10px;border:0;background:#475a84;color:#fff;font:inherit;cursor:pointer">Reintentar</button>
+      <button type="button" id="fxRepair" style="padding:8px 14px;border-radius:10px;border:1px solid #cfc6bb;background:#fff;font:inherit;cursor:pointer">Reparar la app</button>
+      <button type="button" id="fxClose" style="padding:8px 14px;border-radius:10px;border:0;background:transparent;font:inherit;cursor:pointer;color:#555">Cerrar</button></div>
+      <p style="font-size:12px;color:#777;margin:10px 0 0">«Reparar» borra solo la copia guardada del programa (no tus pacientes) y lo vuelve a descargar.</p>`;
+    el.querySelector('#fxRetry').onclick = () => location.reload();
+    el.querySelector('#fxClose').onclick = () => el.remove();
+    el.querySelector('#fxRepair').onclick = async () => {
+      try { for (const r of (await navigator.serviceWorker?.getRegistrations?.()) || []) await r.unregister(); } catch {}
+      try { for (const k of await caches.keys()) await caches.delete(k); } catch {}
+      location.replace(location.pathname + '?r=' + Date.now());
+    };
+  } catch {}
+}
+const fatalInfo = extra => `${extra}\nPaso: ${BOOT.step}${BOOT.notes.length ? '\nAvisos: ' + BOOT.notes.join(' | ') : ''}\nVersión: ${document.documentElement.innerHTML.match(/APP_VERSION = '([^']+)'/)?.[1] || '?'}\n${navigator.userAgent}`;
+addEventListener('error', e => { if (!BOOT.done) showFatal('Smilebook no ha podido abrir', fatalInfo(`${e.message} (${String(e.filename || '').split('/').pop()}:${e.lineno}:${e.colno})`)); });
+addEventListener('unhandledrejection', e => { if (!BOOT.done) showFatal('Smilebook no ha podido abrir', fatalInfo(String(e.reason?.stack || e.reason?.message || e.reason))); });
+setInterval(() => { if (!BOOT.done && !BOOT.wait && Date.now() - BOOT.at > 15000 && !document.getElementById('fatal')) showFatal('Smilebook está tardando demasiado en abrir', fatalInfo('Se ha quedado parado.')); }, 2000);
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 const DEG = Math.PI / 180;
@@ -1503,7 +1532,7 @@ async function openSealedFile(f, start, key){
     out.push(await aesOpen(key, {iv, ct: await f.slice(o + 16, o + 16 + len).arrayBuffer()})); o += 16 + len; }
   return new Blob(out).arrayBuffer();
 }
-const APP_VERSION = '1.5.1';
+const APP_VERSION = '1.5.2';
 /* the installed app announces a downloaded update; one tap swaps it in (after pending saves) and reloads */
 addEventListener('ps-update', e => {
   if ($('#updBar')) return;
@@ -1520,8 +1549,10 @@ const DB = {
     return new Promise((res, rej) => {
       let rq; try { rq = indexedDB.open('encuadre-clinico', 5); } catch (e){ return rej(e); }
       rq.onupgradeneeded = () => { for (const s of STORES) if (!rq.result.objectStoreNames.contains(s)) rq.result.createObjectStore(s, {keyPath:'id'}); };
-      rq.onsuccess = () => { this.db = rq.result; res(); };
+      rq.onsuccess = () => { this.db = rq.result; this.db.onversionchange = () => this.db.close(); res(); };
       rq.onerror = () => rej(rq.error);
+      rq.onblocked = () => rej(new Error('Otra pestaña de Smilebook está usando el archivo: ciérrala y recarga.'));
+      setTimeout(() => rej(new Error('El navegador no respondió al abrir el archivo')), 12000);
     });
   },
   tx(store, mode, fn){
@@ -6495,26 +6526,39 @@ $('#perioToCase').onclick = async () => {
    ====================================================================== */
 new ResizeObserver(() => { if (S.W && !$('#viewEd').hidden){ fitView(); req(); } }).observe(box);
 async function boot(){
-  try { await DB.open(); } catch { L.ok = false; }
+  const soft = async (name, fn) => { bootStep(name); try { await fn(); } catch (e){ BOOT.notes.push(name + ': ' + (e?.message || e)); console.warn(name, e); } };
+  bootStep('abriendo el archivo del navegador');
+  try { await DB.open(); } catch (e){ L.ok = false; BOOT.notes.push('archivo: ' + (e?.message || e)); }
+  bootStep('esperando la contraseña', true);
   const lockEl = L.ok ? await vaultGate() : null;
+  bootStep('leyendo pacientes');
   try {
-    for (const s of ['patients', 'cases', 'sessions', 'images', 'posts', 'perio']) L[s] = (await DB.all(s)) || [];
+    for (const s of ['patients', 'cases', 'sessions', 'images', 'posts', 'perio']) L[s] = ((await DB.all(s)) || []).filter(x => x && typeof x === 'object' && x.id);
+    for (const p of L.patients){ if (typeof p.name !== 'string' || !p.name.trim()) p.name = 'Paciente sin nombre'; }
+    for (const c of L.cases){ if (typeof c.title !== 'string' || !c.title.trim()) c.title = 'Caso sin título'; }
+    for (const x of L.sessions){ if (typeof x.label !== 'string') x.label = 'Sesión'; }
+    for (const e of L.perio){ if (typeof e.date !== 'string') e.date = new Date(e.createdAt || Date.now()).toISOString().slice(0, 10); }
     const br = await DB.get('meta', 'brand'); if (br?.value) Object.assign(IG.brand, br.value);
     const lb = await DB.get('meta', 'lastBackup'); L.lastBackup = lb?.value || null;
     const seeded = await DB.get('meta', 'seeded');
     if (!seeded && !L.patients.length){ await seedExample(); await DB.put('meta', {id: 'seeded', value: true}); }
   } catch { if (!L.patients.length) await seedExample(); }
-  try { L.persistent = await navigator.storage?.persisted?.() || false; } catch {}
-  await autoPurge();
-  try { const pr = await DB.get('meta', 'prefs'); if (pr?.value && !localStorage.getItem('ec-prefs')){ Object.assign(PREFS, pr.value); migratePrefs(); } } catch {}
-  SYS_AVAIL = SYS_FONTS.filter(fontAvailable);
-  await loadFonts(); await loadArt(); styleSync(); applyPrefs();
-  try { const tm = await DB.get('meta', 'taken'); L.takenMap = tm?.value || {}; } catch { L.takenMap = {}; }
-  setTimeout(backfillDates, 400);
-  for (const [r, f] of Object.entries(IG.brand.fonts || {})) ensureFont(f, fw(r));
-  if (!L.sel && L.patients.some(alive)) L.sel = [...L.patients.filter(alive)].sort((a, b) => a.name.localeCompare(b.name, 'es'))[0].id;
+  await soft('permisos de almacenamiento', async () => { L.persistent = await navigator.storage?.persisted?.() || false; });
+  await soft('vaciando la papelera antigua', autoPurge);
+  await soft('preferencias', async () => { const pr = await DB.get('meta', 'prefs'); if (pr?.value && !localStorage.getItem('ec-prefs')){ Object.assign(PREFS, pr.value); migratePrefs(); }
+    if (!Array.isArray(PREFS.gfonts)) PREFS.gfonts = [...GF_DEFAULTS, 'Inter']; });
+  await soft('fuentes del sistema', async () => { SYS_AVAIL = SYS_FONTS.filter(fontAvailable); });
+  await soft('fuentes', () => Promise.race([loadFonts(), new Promise(r => setTimeout(r, 4000))]));
+  await soft('dibujos de dientes', loadArt);
+  await soft('estilo', async () => { styleSync(); applyPrefs(); });
+  await soft('fechas', async () => { try { const tm = await DB.get('meta', 'taken'); L.takenMap = tm?.value || {}; } catch { L.takenMap = {}; } setTimeout(backfillDates, 400); });
+  await soft('fuentes de marca', async () => { for (const [r, f] of Object.entries(IG.brand.fonts || {})) ensureFont(f, fw(r)); });
+  await soft('ordenando pacientes', async () => { if (!L.sel && L.patients.some(alive)) L.sel = [...L.patients.filter(alive)].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'es'))[0].id; });
+  bootStep('mostrando el archivo');
   setView('lib'); await navRestore().catch(() => {});
-  VAULT.onProgress = null; lockEl?.remove(); $('#lockBtn').hidden = !VAULT.rec; setTimeout(async () => { await resumeEncryption(); await migrateParts(); }, 1500);
+  VAULT.onProgress = null; lockEl?.remove();
+  BOOT.done = true;
+  if (BOOT.notes.length) console.warn('Smilebook: avisos al abrir', BOOT.notes); $('#lockBtn').hidden = !VAULT.rec; setTimeout(async () => { await resumeEncryption(); await migrateParts(); }, 1500);
   if (VAULT.key){ await odLoadTok(); await odHandleRedirect(); setTimeout(odAutoBackup, 5000); }
   if (VAULT.unreadable) setTimeout(rescueOffer, 600);
   if (!VAULT.rec && odWeb()){
@@ -6557,7 +6601,8 @@ function askBackupRaw(rec){
       $('#brErr').textContent = 'No es correcta.'; };
   });
 }
-(document.fonts ? document.fonts.ready : Promise.resolve()).then(boot, boot);
+// fonts are a nicety: never wait for them more than 2.5 s (a blocked or slow font server must not stop the app)
+Promise.race([document.fonts ? document.fonts.ready : Promise.resolve(), new Promise(r => setTimeout(r, 2500))]).then(boot, boot);
 })();
 </script>
 
