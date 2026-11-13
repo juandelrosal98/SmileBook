@@ -1503,7 +1503,7 @@ async function openSealedFile(f, start, key){
     out.push(await aesOpen(key, {iv, ct: await f.slice(o + 16, o + 16 + len).arrayBuffer()})); o += 16 + len; }
   return new Blob(out).arrayBuffer();
 }
-const APP_VERSION = '1.5.0';
+const APP_VERSION = '1.5.1';
 /* the installed app announces a downloaded update; one tap swaps it in (after pending saves) and reloads */
 addEventListener('ps-update', e => {
   if ($('#updBar')) return;
@@ -1966,7 +1966,7 @@ async function renderStore(){
        <div class="odbtns"><button type="button" id="odSideUp">${OD.busy ? 'Guardando…' : 'Guardar ahora'}</button><button type="button" id="odSideRe">Cargar copia</button></div></div>`
     : `<div class="odcard"><button type="button" class="odsign" id="odSideIn">${OD_ICON}<span>Iniciar sesión en OneDrive<small>Tus pacientes se guardan solos en tu nube</small></span></button></div>`;
   if (warn && OD.tok && /copia/.test(warn)) warn = '';
-  $('#storeInfo').innerHTML = od + `<div class="storerow"><span>En este navegador</span><b>${fmtMB(used)}</b></div><div class="gauge" title="${pct.toFixed(1).replace('.', ',')} % del espacio disponible"><i style="width:${Math.max(.5, pct)}%"></i></div>${warn ? `<div class="storerow">${warn}</div>` : ''}`;
+  $('#storeInfo').innerHTML = od + `<div class="storerow"><span>En este navegador</span><b>${fmtMB(used)}</b></div><div class="gauge" title="${pct.toFixed(1).replace('.', ',')} % del espacio disponible"><i style="width:${Math.max(.5, pct)}%"></i></div>${warn ? `<div class="storerow">${warn}</div>` : ''}<div class="storerow" style="opacity:.55;font-size:11px"><span>Smilebook ${APP_VERSION}</span></div>`;
   $('#encLink')?.addEventListener('click', () => enableVault());
   $('#odSideIn')?.addEventListener('click', odSignIn);
   $('#odSideUp')?.addEventListener('click', () => { if (!OD.busy) odBackupNow(false); });
